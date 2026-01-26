@@ -26,6 +26,10 @@ cat > "$OUTPUT_DIR/hdfs-site.xml" <<EOF
     <name>dfs.datanode.data.dir</name>
     <value>$HADOOP_DATA_DIR/datanode</value>
   </property>
+  <property>
+    <name>dfs.namenode.fs-limits.min-block-size</name>
+    <value>131072</value>
+  </property>
 </configuration>
 EOF
 

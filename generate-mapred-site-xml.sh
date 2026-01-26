@@ -29,6 +29,55 @@ cat > "$OUTPUT_DIR/mapred-site.xml" <<EOF
     <name>mapreduce.reduce.env</name>
     <value>HADOOP_MAPRED_HOME=$HADOOP_HOME</value>
   </property>
+  <!-- Memory per map task - needs enough heap for WordCount -->
+  <property>
+    <name>mapreduce.map.memory.mb</name>
+    <value>1536</value>
+  </property>
+  <property>
+    <name>mapreduce.map.java.opts</name>
+    <value>-Xmx1280m</value>
+  </property>
+  <property>
+    <name>mapreduce.reduce.memory.mb</name>
+    <value>2048</value>
+  </property>
+  <property>
+    <name>mapreduce.reduce.java.opts</name>
+    <value>-Xmx1536m</value>
+  </property>
+  <!-- JVM reuse: run multiple tasks per JVM to reduce startup overhead -->
+  <property>
+    <name>mapreduce.job.jvm.numtasks</name>
+    <value>-1</value>
+  </property>
+  <!-- Increase AM memory for jobs with many tasks -->
+  <property>
+    <name>yarn.app.mapreduce.am.resource.mb</name>
+    <value>2048</value>
+  </property>
+  <property>
+    <name>yarn.app.mapreduce.am.command-opts</name>
+    <value>-Xmx1536m</value>
+  </property>
+  <!-- Sort settings -->
+  <property>
+    <name>mapreduce.task.io.sort.mb</name>
+    <value>128</value>
+  </property>
+  <property>
+    <name>mapreduce.task.io.sort.factor</name>
+    <value>48</value>
+  </property>
+  <!-- Speculative execution off to save resources -->
+  <property>
+    <name>mapreduce.map.speculative</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>mapreduce.reduce.speculative</name>
+    <value>false</value>
+  </property>
 </configuration>
 EOF
 
