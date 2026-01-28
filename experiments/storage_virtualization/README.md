@@ -57,6 +57,27 @@ Proposed Virtualized Storage:
 
 ## Experiments
 
+### Quick Start: Run All Experiments
+**Script**: `run-full-experiment.sh`
+
+Master script that runs all storage virtualization experiments in sequence:
+
+```bash
+# Run all experiments
+bash run-full-experiment.sh all
+
+# Run specific experiment
+bash run-full-experiment.sh block_scaling    # Only block scaling
+bash run-full-experiment.sh storage_dirs     # Only storage dirs
+bash run-full-experiment.sh memory           # Only memory monitoring
+bash run-full-experiment.sh failure          # Only failure simulation
+```
+
+Output is saved to `results/full_experiment_<timestamp>/` with:
+- Combined results from all experiments
+- `SUMMARY.md` with key findings
+- `experiment.log` with detailed execution log
+
 ### Experiment 1: Block Size Scaling
 **Script**: `../wordcount/benchmark-blocksize.sh`
 

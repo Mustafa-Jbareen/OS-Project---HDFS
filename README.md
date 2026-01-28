@@ -10,8 +10,9 @@ my_scripts/
 ├── pom.xml                            # Maven project for MiniDFSCluster experiments
 │
 ├── # === Root-Level HDFS Management Scripts ===
-├── restart-hdfs.sh                    # Full HDFS restart (stop, clean, reformat, start)
+├── start-hdfs.sh                      # Start all Hadoop services (HDFS + YARN)
 ├── stop-hdfs.sh                       # Stop all Hadoop services (HDFS + YARN)
+├── restart-hdfs.sh                    # Full HDFS restart (stop, clean, reformat, start)
 ├── clear-hdfs.sh                      # Clear HDFS data directories (requires restart)
 ├── reformat-and-start.sh              # Format NameNode and start cluster
 ├── reset-hdfs-contents.sh             # Remove all HDFS files (keeps services running)
@@ -20,14 +21,9 @@ my_scripts/
 ├── install-all-nodes.sh               # Install Java, SSH, Hadoop on all nodes
 ├── setup-cluster-automated.sh         # Full automated cluster setup
 ├── setup-ssh.sh                       # Configure passwordless SSH
-├── generate-core-site-xml.sh          # Generate core-site.xml
-├── generate-hdfs-site-xml.sh          # Generate hdfs-site.xml
-├── generate-mapred-site-xml.sh        # Generate mapred-site.xml
-├── generate-yarn-site-xml.sh          # Generate yarn-site.xml
-├── generate-workers-file.sh           # Generate workers file
 │
 ├── scripts/                           # Organized script modules
-│   ├── hdfs/                          # HDFS management scripts
+│   ├── hdfs/                          # HDFS management scripts (mirrors root scripts)
 │   │   ├── start-hdfs.sh
 │   │   ├── stop-hdfs.sh
 │   │   ├── restart-hdfs.sh
@@ -53,19 +49,21 @@ my_scripts/
 │   │   ├── collect-results.sh         # Collect results from HDFS
 │   │   ├── analyze.py                 # Analyze multiple runs
 │   │   └── plot-blocksize-results.py  # Plot benchmark results
+│   ├── storage_virtualization/        # Storage virtualization experiments
+│   │   ├── README.md                  # Detailed experiment documentation
+│   │   ├── benchmark-block-scaling.sh # Block count scaling benchmark
+│   │   ├── benchmark-storage-dirs.sh  # Storage directory scaling benchmark
+│   │   ├── monitor-namenode-memory.sh # NameNode memory monitoring
+│   │   ├── run-full-experiment.sh     # Run all experiments
+│   │   ├── simulate-virtual-storage-failure.sh  # Failure simulation
+│   │   └── plot-storage-virtualization.py       # Plot results
 │   ├── mini_dfs_cluster/              # MiniDFSCluster memory experiment
 │   │   ├── plot_memory.py
 │   │   └── requirements.txt
 │   └── results/                       # Experiment results (gitignored)
 │
-├── results/                           # All experiment results
-│   ├── wordcount/                     # Individual WordCount run results
-│   └── blocksize-benchmark/           # Block size benchmark runs
-│       ├── run_2026-01-26_10-30-00/   # Timestamped run directories
-│       │   ├── results.csv
-│       │   ├── metadata.json
-│       │   └── benchmark.log
-│       └── latest -> run_xxx/         # Symlink to most recent run
+├── backup_unused_files/               # Archived unused scripts
+│   └── README.md
 │
 └── src/                               # Java source code
     └── main/java/com/example/
@@ -94,6 +92,13 @@ Removes all files from HDFS while keeping services running:
 
 ```bash
 bash reset-hdfs-contents.sh
+```
+
+### start-hdfs.sh (Start Services)
+Starts all Hadoop services (HDFS and YARN):
+
+```bash
+bash start-hdfs.sh
 ```
 
 ### Other HDFS Scripts
@@ -194,7 +199,7 @@ This makes the relationship between KB and bytes explicit:
 
 1. **Lower the minimum block size** to 128KB so small block sizes are allowed:
    ```bash
-   bash generate-hdfs-site-xml.sh
+   bash scripts/cluster/config/generate-hdfs-site-xml.sh
    bash restart-hdfs.sh  # Full restart with new config
    ```
 
