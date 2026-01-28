@@ -2,26 +2,104 @@
 
 This guide provides instructions for setting up and managing a multi-node Hadoop cluster using the provided scripts.
 
-## Directory Overview
+## Directory Structure
 
-### Key Scripts
-- **install-all-nodes.sh**: Installs Java, SSH, and Hadoop on all nodes in parallel.
-- **setup-cluster-automated.sh**: Automates the entire cluster configuration, deployment, and startup process.
-- **setup-ssh.sh**: Configures passwordless SSH between all nodes in the cluster.
-- **clear-hdfs.sh**: Clears all HDFS data from NameNode and DataNode directories.
-- **reformat-and-start.sh**: Reformats the NameNode and starts the Hadoop cluster.
-- **restart-hdfs.sh**: Restarts HDFS services while preserving data.
-- **stop-hdfs.sh**: Stops all Hadoop services (HDFS and YARN).
+```
+my_scripts/
+├── README.md                          # This file
+├── pom.xml                            # Maven project for MiniDFSCluster experiments
+│
+├── # === Root-Level HDFS Management Scripts ===
+├── restart-hdfs.sh                    # Full HDFS restart (stop, clean, reformat, start)
+├── stop-hdfs.sh                       # Stop all Hadoop services (HDFS + YARN)
+├── clear-hdfs.sh                      # Clear HDFS data directories (requires restart)
+├── reformat-and-start.sh              # Format NameNode and start cluster
+├── reset-hdfs-contents.sh             # Remove all HDFS files (keeps services running)
+│
+├── # === Cluster Setup Scripts ===
+├── install-all-nodes.sh               # Install Java, SSH, Hadoop on all nodes
+├── setup-cluster-automated.sh         # Full automated cluster setup
+├── setup-ssh.sh                       # Configure passwordless SSH
+├── generate-core-site-xml.sh          # Generate core-site.xml
+├── generate-hdfs-site-xml.sh          # Generate hdfs-site.xml
+├── generate-mapred-site-xml.sh        # Generate mapred-site.xml
+├── generate-yarn-site-xml.sh          # Generate yarn-site.xml
+├── generate-workers-file.sh           # Generate workers file
+│
+├── scripts/                           # Organized script modules
+│   ├── hdfs/                          # HDFS management scripts
+│   │   ├── start-hdfs.sh
+│   │   ├── stop-hdfs.sh
+│   │   ├── restart-hdfs.sh
+│   │   ├── clear-hdfs.sh
+│   │   ├── reformat-and-start.sh
+│   │   └── reset-hdfs-contents.sh
+│   └── cluster/                       # Cluster setup scripts
+│       └── config/                    # Configuration generators
+│           ├── generate-core-site-xml.sh
+│           ├── generate-hdfs-site-xml.sh
+│           ├── generate-mapred-site-xml.sh
+│           ├── generate-yarn-site-xml.sh
+│           └── generate-workers-file.sh
+│
+├── experiments/                       # Experiment scripts and utilities
+│   ├── common/                        # Shared configuration and utilities
+│   │   ├── cluster.conf               # Cluster configuration
+│   │   └── utils.sh                   # Utility functions
+│   ├── wordcount/                     # WordCount benchmark experiment
+│   │   ├── benchmark-blocksize.sh     # Block size benchmark (with timestamped runs)
+│   │   ├── run.sh                     # Run WordCount job
+│   │   ├── generate-input.sh          # Generate input data
+│   │   ├── collect-results.sh         # Collect results from HDFS
+│   │   ├── analyze.py                 # Analyze multiple runs
+│   │   └── plot-blocksize-results.py  # Plot benchmark results
+│   ├── mini_dfs_cluster/              # MiniDFSCluster memory experiment
+│   │   ├── plot_memory.py
+│   │   └── requirements.txt
+│   └── results/                       # Experiment results (gitignored)
+│
+├── results/                           # All experiment results
+│   ├── wordcount/                     # Individual WordCount run results
+│   └── blocksize-benchmark/           # Block size benchmark runs
+│       ├── run_2026-01-26_10-30-00/   # Timestamped run directories
+│       │   ├── results.csv
+│       │   ├── metadata.json
+│       │   └── benchmark.log
+│       └── latest -> run_xxx/         # Symlink to most recent run
+│
+└── src/                               # Java source code
+    └── main/java/com/example/
+        └── MiniDFSClusterExperiment.java
+```
 
-### Experiments Directory
-- **common/**: Contains shared configuration and utility scripts for experiments.
-  - `cluster.conf`: Cluster configuration file.
-  - `utils.sh`: Utility functions for experiments.
-- **wordcount/**: Contains scripts for running the WordCount experiment.
-  - `analyze.py`: Analyzes WordCount experiment results.
-  - `collect-results.sh`: Collects results from WordCount experiments.
-  - `generate-input.sh`: Generates input data for WordCount experiments.
-  - `run.sh`: Executes the WordCount experiment.
+## HDFS Management Scripts
+
+### restart-hdfs.sh (Full Restart)
+Performs a complete HDFS reset equivalent to a fresh setup:
+1. Stops all Hadoop services (HDFS + YARN)
+2. Cleans NameNode state
+3. Cleans DataNode state
+4. Reformats NameNode
+5. Starts fresh cluster
+
+```bash
+bash restart-hdfs.sh
+```
+
+### reset-hdfs-contents.sh (Soft Reset)
+Removes all files from HDFS while keeping services running:
+- Deletes all user files and directories
+- Empties trash
+- Does NOT restart services
+
+```bash
+bash reset-hdfs-contents.sh
+```
+
+### Other HDFS Scripts
+- **stop-hdfs.sh**: Stop all Hadoop services
+- **clear-hdfs.sh**: Clear data directories (requires manual restart)
+- **reformat-and-start.sh**: Format NameNode and start cluster
 
 ---
 
@@ -100,17 +178,24 @@ python experiments/mini_dfs_cluster/plot_memory.py results/memory_usage.csv -o r
 
 The helper sorts the samples, converts the memory usage to MiB, and draws a logarithmic x-axis with an optional log y-axis via the `--log-y` flag.
 
-## Real cluster WordCount benchmark (block-size scaling)
+## Real Cluster WordCount Benchmark (Block-Size Scaling)
 
-Once the cluster is configured, you can run the WordCount job on actual nodes and measure how the runtime behaves as you change the HDFS block size from **128KB to 1GB**.
+Once the cluster is configured, you can run the WordCount job on actual nodes and measure how the runtime behaves as you change the HDFS block size from **128KB to 256MB**.
+
+### Block Size Notation
+
+Block sizes are expressed as: `KB × 2^10` bytes
+
+This makes the relationship between KB and bytes explicit:
+- 128 KB = 128 × 2^10 = 128 × 1024 = 131,072 bytes
+- 1 MB = 1024 × 2^10 = 1024 × 1024 = 1,048,576 bytes
 
 ### Prerequisites
 
 1. **Lower the minimum block size** to 128KB so small block sizes are allowed:
    ```bash
    bash generate-hdfs-site-xml.sh
-   # Then restart HDFS on all nodes
-   bash stop-hdfs.sh && bash restart-hdfs.sh
+   bash restart-hdfs.sh  # Full restart with new config
    ```
 
 2. Ensure `matplotlib` and `pandas` are installed for plotting:
@@ -120,7 +205,7 @@ Once the cluster is configured, you can run the WordCount job on actual nodes an
 
 ### Automated Benchmark Script
 
-Run the full sweep from 128KB to 1GB with a single command:
+Run the full sweep from 128KB to 256MB with a single command:
 
 ```bash
 bash experiments/wordcount/benchmark-blocksize.sh 512
@@ -128,42 +213,44 @@ bash experiments/wordcount/benchmark-blocksize.sh 512
 
 This will:
 - Generate 512MB of input data for each block size configuration
-- Test 14 block sizes: 128KB, 256KB, 512KB, 1MB, 2MB, 4MB, 8MB, 16MB, 32MB, 64MB, 128MB, 256MB, 512MB, 1GB
+- Test 12 block sizes: 128KB, 256KB, 512KB, 1MB, 2MB, 4MB, 8MB, 16MB, 32MB, 64MB, 128MB, 256MB
 - Record runtime and number of splits for each configuration
-- Output results to `results/wordcount-blocksize.csv`
+- Save results to a **timestamped directory** (never overwrites previous runs)
+
+### Result Preservation
+
+Each benchmark run creates a unique timestamped directory:
+```
+results/blocksize-benchmark/
+├── run_2026-01-26_10-30-00/
+│   ├── results.csv       # Main results file
+│   ├── metadata.json     # Run configuration
+│   └── benchmark.log     # Detailed execution log
+├── run_2026-01-26_14-45-00/
+│   └── ...
+└── latest -> run_2026-01-26_14-45-00/  # Symlink to most recent
+```
 
 ### Generate the Figure
 
 After the benchmark completes, create the visualization:
 
 ```bash
+# Plot the latest run
 python3 experiments/wordcount/plot-blocksize-results.py
+
+# Or specify a specific run
+python3 experiments/wordcount/plot-blocksize-results.py results/blocksize-benchmark/run_2026-01-26_10-30-00/results.csv
 ```
 
 This produces:
-- `results/wordcount-blocksize.png` - PNG image of the plot
-- `results/wordcount-blocksize.pdf` - High-quality PDF version
+- PNG and PDF plots saved in the run directory
 - Console summary with optimal block size recommendation
-
-### Manual Benchmark Loop
-
-If you prefer to run manually or customize the block sizes:
-
-```bash
-# Block sizes from 128KB to 1GB
-for block_size in 131072 262144 524288 1048576 2097152 4194304 8388608 16777216 33554432 67108864 134217728 268435456 536870912 1073741824; do
-  hdfs dfs -rm -r -f /user/$USER/wordcount/input
-  bash experiments/wordcount/generate-input.sh 512 "$block_size"
-  bash experiments/wordcount/run.sh
-  runtime=$(cat results/wordcount/*/runtime_seconds.txt | tail -1)
-  echo "$block_size,$runtime" >> results/wordcount-blocksize-manual.csv
-done
-```
 
 ### Understanding the Results
 
 - **Smaller block sizes** (128KB-1MB): More blocks mean more map tasks, higher overhead, but better parallelism for small files
-- **Larger block sizes** (64MB-1GB): Fewer blocks mean fewer map tasks, less overhead, but may underutilize cluster resources
+- **Larger block sizes** (64MB-256MB): Fewer blocks mean fewer map tasks, less overhead, but may underutilize cluster resources
 - **Optimal block size**: Depends on your cluster size, input data characteristics, and job type
 
 The plot shows runtime on the primary y-axis and number of blocks/splits on the secondary y-axis, helping you visualize the trade-off between parallelism and overhead.

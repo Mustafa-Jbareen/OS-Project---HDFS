@@ -65,11 +65,12 @@ validate_prerequisites() {
 
 call_config_generators() {
     log_info "Generating Hadoop configuration files..."
-    bash "$(dirname "$0")/generate-core-site-xml.sh" "$HADOOP_HOME/etc/hadoop"
-    bash "$(dirname "$0")/generate-hdfs-site-xml.sh" "$HADOOP_HOME/etc/hadoop"
-    bash "$(dirname "$0")/generate-yarn-site-xml.sh" "$HADOOP_HOME/etc/hadoop"
-    bash "$(dirname "$0")/generate-mapred-site-xml.sh" "$HADOOP_HOME/etc/hadoop"
-    bash "$(dirname "$0")/generate-workers-file.sh" "$HADOOP_HOME/etc/hadoop"
+    local CONFIG_DIR="$(dirname "$0")/scripts/cluster/config"
+    bash "$CONFIG_DIR/generate-core-site-xml.sh" "$HADOOP_HOME/etc/hadoop"
+    bash "$CONFIG_DIR/generate-hdfs-site-xml.sh" "$HADOOP_HOME/etc/hadoop"
+    bash "$CONFIG_DIR/generate-yarn-site-xml.sh" "$HADOOP_HOME/etc/hadoop"
+    bash "$CONFIG_DIR/generate-mapred-site-xml.sh" "$HADOOP_HOME/etc/hadoop"
+    bash "$CONFIG_DIR/generate-workers-file.sh" "$HADOOP_HOME/etc/hadoop"
     log_success "Hadoop configuration files generated"
 }
 

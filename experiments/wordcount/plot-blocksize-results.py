@@ -3,12 +3,13 @@
 SCRIPT: plot-blocksize-results.py
 DESCRIPTION: Plots WordCount runtime as a function of HDFS block size.
              Creates a figure showing how block size affects MapReduce performance.
-USAGE: python3 plot-blocksize-results.py [csv_file]
+             Supports both old and new CSV formats, and can compare multiple runs.
+USAGE: python3 plot-blocksize-results.py [csv_file_or_run_dir]
 PREREQUISITES:
     - matplotlib and pandas installed (pip install matplotlib pandas)
-    - Benchmark results in results/wordcount-blocksize.csv
+    - Benchmark results from benchmark-blocksize.sh
 OUTPUT:
-    - results/wordcount-blocksize.png (plot image)
+    - Plot image saved next to the CSV file
     - Console summary statistics
 """
 
@@ -27,27 +28,80 @@ except ImportError as e:
     sys.exit(1)
 
 
-def main():
-    # Determine CSV file path
+def find_csv_file(arg=None):
+    """Find the CSV file to use for plotting."""
     script_dir = Path(__file__).parent
     results_dir = script_dir.parent.parent / "results"
+    blocksize_results_dir = results_dir / "blocksize-benchmark"
     
-    if len(sys.argv) > 1:
-        csv_file = Path(sys.argv[1])
-    else:
-        csv_file = results_dir / "wordcount-blocksize.csv"
+    if arg:
+        path = Path(arg)
+        if path.is_file() and path.suffix == '.csv':
+            return path
+        if path.is_dir():
+            # Check for results.csv in the directory
+            results_csv = path / "results.csv"
+            if results_csv.exists():
+                return results_csv
+        # Try as relative path
+        if not path.is_absolute():
+            for base in [Path.cwd(), script_dir, results_dir]:
+                full_path = base / path
+                if full_path.exists():
+                    if full_path.is_file():
+                        return full_path
+                    elif (full_path / "results.csv").exists():
+                        return full_path / "results.csv"
     
-    if not csv_file.exists():
-        print(f"Error: CSV file not found: {csv_file}")
+    # Try to find latest run
+    latest_link = blocksize_results_dir / "latest"
+    if latest_link.exists():
+        latest_csv = latest_link / "results.csv"
+        if latest_csv.exists():
+            return latest_csv
+    
+    # Fall back to old format location
+    old_csv = results_dir / "wordcount-blocksize.csv"
+    if old_csv.exists():
+        return old_csv
+    
+    return None
+
+
+def main():
+    # Determine CSV file path
+    arg = sys.argv[1] if len(sys.argv) > 1 else None
+    csv_file = find_csv_file(arg)
+    
+    if csv_file is None:
+        print("Error: No CSV file found!")
         print("Run the benchmark first: bash experiments/wordcount/benchmark-blocksize.sh")
+        print("Or specify a CSV file: python3 plot-blocksize-results.py <path/to/results.csv>")
         sys.exit(1)
+    
+    csv_file = Path(csv_file)
+    output_dir = csv_file.parent
     
     # Read data
     df = pd.read_csv(csv_file)
     
-    # Filter out error rows
-    df = df[df['runtime_seconds'] != 'ERROR']
-    df['runtime_seconds'] = df['runtime_seconds'].astype(float)
+    # Handle both old and new CSV formats
+    # New format has: block_size_exp,block_size_bytes,block_size_formula,block_size_human,runtime_seconds,num_splits
+    # Old format has: block_size_bytes,block_size_human,runtime_seconds,num_splits
+    
+    if 'block_size_exp' not in df.columns and 'block_size_kb' not in df.columns and 'block_size_bytes' in df.columns:
+        # Old format - add exponent column (approximate)
+        import math
+        df['block_size_exp'] = df['block_size_bytes'].apply(lambda x: int(math.log2(x)) if x > 0 else 0)
+    elif 'block_size_kb' in df.columns:
+        # Intermediate format with KB
+        import math
+        df['block_size_exp'] = (df['block_size_kb'] * 1024).apply(lambda x: int(math.log2(x)) if x > 0 else 0)
+    
+    # Filter out error/skipped rows
+    df = df[~df['runtime_seconds'].isin(['ERROR', 'SKIPPED'])]
+    df['runtime_seconds'] = pd.to_numeric(df['runtime_seconds'], errors='coerce')
+    df = df.dropna(subset=['runtime_seconds'])
     df['block_size_bytes'] = df['block_size_bytes'].astype(int)
     
     if df.empty:
@@ -67,6 +121,12 @@ def main():
     min_idx = df['runtime_seconds'].idxmin()
     optimal = df.loc[min_idx]
     print(f"\nOptimal block size: {optimal['block_size_human']} ({optimal['runtime_seconds']:.1f}s)")
+    
+    # Show formula if available
+    if 'block_size_formula' in df.columns:
+        print(f"  Formula: {optimal['block_size_formula']} = {optimal['block_size_bytes']} bytes")
+    elif 'block_size_exp' in df.columns:
+        print(f"  Formula: 2^{int(optimal['block_size_exp'])} = {optimal['block_size_bytes']} bytes")
     
     print("\n" + "-" * 60)
     print("Detailed Results:")
@@ -129,12 +189,14 @@ def main():
     plt.tight_layout()
     
     # Save figure
-    output_file = results_dir / "wordcount-blocksize.png"
+    # Determine output filename based on input location
+    run_name = output_dir.name if output_dir.name.startswith("run_") else "blocksize"
+    output_file = output_dir / f"wordcount-blocksize-{run_name}.png"
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     print(f"\nPlot saved to: {output_file}")
     
     # Also save as PDF for higher quality
-    pdf_file = results_dir / "wordcount-blocksize.pdf"
+    pdf_file = output_dir / f"wordcount-blocksize-{run_name}.pdf"
     plt.savefig(pdf_file, bbox_inches='tight')
     print(f"PDF saved to: {pdf_file}")
     

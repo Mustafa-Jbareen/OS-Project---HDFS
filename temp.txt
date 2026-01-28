@@ -1,4 +1,3 @@
-> results/wordcount-blocksize.csv
 for block_size in 1048576 2097152 4194304 8388608 16777216 33554432; do
   hdfs dfs -rm -r -f /user/$USER/wordcount/input
   bash experiments/wordcount/generate-input.sh 256 "$block_size"
