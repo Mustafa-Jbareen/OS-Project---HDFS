@@ -10,7 +10,7 @@ set -e
 
 OUTPUT_DIR=${1:-/home/mostufa.j/hadoop/etc/hadoop}
 MASTER_NODE="tapuz14"
-WORKER_NODES=("tapuz13")
+WORKER_NODES=("tapuz10" "tapuz11" "tapuz12" "tapuz13")
 
 printf "%s\n" "$MASTER_NODE" "${WORKER_NODES[@]}" > "$OUTPUT_DIR/workers"
 

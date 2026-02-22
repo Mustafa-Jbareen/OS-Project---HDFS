@@ -22,24 +22,24 @@ cat > "$OUTPUT_DIR/yarn-site.xml" <<EOF
     <value>mapreduce_shuffle</value>
   </property>
   <!-- Memory settings for NodeManagers -->
-  <!-- Adjust based on actual RAM: use ~80% of physical memory -->
-  <!-- For 16GB RAM nodes, use 12288; for 32GB nodes, use 24576 -->
+  <!-- Optimized for 4-core, ~8GB RAM nodes (tapuz10-14) -->
+  <!-- 7900 MB - 1500 MB for OS = 6400 MB available for YARN tasks -->
   <property>
     <name>yarn.nodemanager.resource.memory-mb</name>
-    <value>16384</value>
+    <value>6400</value>
   </property>
   <property>
     <name>yarn.scheduler.minimum-allocation-mb</name>
-    <value>512</value>
+    <value>100</value>
   </property>
   <property>
     <name>yarn.scheduler.maximum-allocation-mb</name>
-    <value>16384</value>
+    <value>2048</value>
   </property>
-  <!-- CPU cores per NodeManager (adjust based on actual cores) -->
+  <!-- CPU cores per NodeManager (4 cores per node) -->
   <property>
     <name>yarn.nodemanager.resource.cpu-vcores</name>
-    <value>8</value>
+    <value>4</value>
   </property>
   <!-- Virtual memory check disabled (often causes issues) -->
   <property>

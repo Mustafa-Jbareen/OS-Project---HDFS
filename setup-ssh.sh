@@ -22,7 +22,7 @@ log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-CLUSTER_FILE="/csl/mostufa.j/cluster"
+CLUSTER_FILE="$HOME/cluster"
 
 log_info "Validating prerequisites..."
 

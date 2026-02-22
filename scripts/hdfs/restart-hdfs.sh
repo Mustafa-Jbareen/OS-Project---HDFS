@@ -20,7 +20,7 @@ HADOOP_HOME=/home/mostufa.j/hadoop
 HADOOP_DATA_DIR=/home/mostufa.j/hadoop_data
 
 # Worker nodes - must match your cluster configuration
-WORKER_NODES=("tapuz13")
+WORKER_NODES=("tapuz10" "tapuz11" "tapuz12" "tapuz13")
 
 echo "=============================================="
 echo "HDFS Full Restart (Fresh Initialization)"

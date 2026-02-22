@@ -15,8 +15,8 @@ set -euo pipefail
 # CONFIGURATION
 # ============================================================================ 
 MASTER_NODE="tapuz14"
-WORKER_NODES=("tapuz13")   # master included automatically
-REPLICATION_FACTOR=2
+WORKER_NODES=("tapuz10" "tapuz11" "tapuz12" "tapuz13")   # master included automatically
+REPLICATION_FACTOR=3
 NAMENODE_PORT=9000
 HADOOP_HOME="/home/mostufa.j/hadoop"
 HADOOP_DATA_DIR="/home/mostufa.j/hadoop_data"

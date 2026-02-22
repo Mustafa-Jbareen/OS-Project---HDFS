@@ -15,6 +15,19 @@
 
 set -euo pipefail
 
+# ============================================================================
+# CLEANUP TRAP
+# ============================================================================
+cleanup() {
+    echo ""
+    echo "Caught interrupt, cleaning up..."
+    pkill -P $$ 2>/dev/null || true
+    hdfs dfs -rm -r -f /failure_test 2>/dev/null || true
+    echo "Cleanup complete."
+    exit 1
+}
+trap cleanup SIGINT SIGTERM
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_DIR="$SCRIPT_DIR/results"
 mkdir -p "$RESULTS_DIR"
@@ -46,7 +59,26 @@ get_block_count() {
 }
 
 get_under_replicated_blocks() {
-    hdfs fsck / 2>/dev/null | grep -i "Under-replicated" | grep -o '[0-9]*' | head -1 || echo "0"
+    # Use JMX instead of hdfs fsck to avoid spawning long-running processes
+    local JMX_DATA=$(curl -sL --connect-timeout 5 "http://${MASTER_NODE}:9870/jmx" 2>/dev/null || echo "{}")
+    
+    if command -v python3 &>/dev/null; then
+        echo "$JMX_DATA" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for bean in data.get('beans', []):
+        if 'FSNamesystem' in bean.get('name', ''):
+            print(bean.get('UnderReplicatedBlocks', 0))
+            break
+    else:
+        print(0)
+except:
+    print(0)
+" 2>/dev/null || echo "0"
+    else
+        echo "$JMX_DATA" | grep -oP '"UnderReplicatedBlocks"\s*:\s*\K[0-9]+' | head -1 || echo "0"
+    fi
 }
 
 get_storage_count() {
@@ -156,8 +188,11 @@ log "─────────────────────────
 hdfs dfs -mkdir -p /failure_test 2>/dev/null || true
 
 log "Uploading ${TEST_FILE_SIZE_MB}MB test file..."
-dd if=/dev/urandom bs=1M count=$TEST_FILE_SIZE_MB 2>/dev/null | \
-    hdfs dfs -put - /failure_test/testdata.bin 2>/dev/null
+# Create temp file first to avoid piping issues
+TEMP_FILE=$(mktemp)
+dd if=/dev/urandom of="$TEMP_FILE" bs=1M count=$TEST_FILE_SIZE_MB 2>/dev/null
+hdfs dfs -put -f "$TEMP_FILE" /failure_test/testdata.bin 2>/dev/null
+rm -f "$TEMP_FILE"
 
 BLOCKS_AFTER_UPLOAD=$(get_block_count)
 log "Blocks after upload: $BLOCKS_AFTER_UPLOAD"

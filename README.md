@@ -126,6 +126,7 @@ EOF
 ```bash
 cat > /csl/mostufa.j/cluster << EOF
 tapuz14
+tapuz12
 tapuz13
 EOF
 ```

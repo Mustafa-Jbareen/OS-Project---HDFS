@@ -14,10 +14,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 public class MiniDFSClusterExperiment {
-	private static final int DEFAULT_MAX_DATANODES = 32;
-	private static final long ITERATION_PAUSE_MS = 2_000;
+	private static final int DEFAULT_MAX_DATANODES = 4096;
+	private static final long ITERATION_PAUSE_MS = 5_000;
 
 	public static void main(String[] args) throws Exception {
 		int maxDataNodes = DEFAULT_MAX_DATANODES;
@@ -47,6 +48,9 @@ public class MiniDFSClusterExperiment {
 			baseDir.deleteOnExit();
 
 			System.out.println("Starting MiniDFSCluster with " + numDataNodes + " DataNodes (data dir: " + baseDir.getAbsolutePath() + ")");
+			System.out.println("  Pre-start: threads=" + Thread.activeCount()
+				+ "  heapUsed=" + ((Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / (1024*1024)) + "MB"
+				+ "  heapMax=" + (Runtime.getRuntime().maxMemory() / (1024*1024)) + "MB");
 			try {
 				runIteration(numDataNodes, baseDir, samples);
 			} catch (OutOfMemoryError oome) {
@@ -59,11 +63,17 @@ public class MiniDFSClusterExperiment {
 				deleteDirectory(baseDir);
 			}
 
-			try {
-				Thread.sleep(ITERATION_PAUSE_MS);
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
-				System.err.println("Interrupted between iterations; stopping.");
+			// Force GC and give daemon threads time to die between iterations
+			System.gc();
+			Thread.sleep(ITERATION_PAUSE_MS);
+			System.gc();
+			Thread.sleep(1_000);
+
+			// Log active thread count to track thread leaks
+			int activeThreads = Thread.activeCount();
+			System.out.println("Active threads after cleanup: " + activeThreads);
+			if (activeThreads > 25_000) {
+				System.err.println("WARNING: Thread count (" + activeThreads + ") approaching ulimit. Stopping to avoid crash.");
 				break;
 			}
 		}
@@ -77,8 +87,43 @@ public class MiniDFSClusterExperiment {
 		Configuration conf = new Configuration();
 		conf.set(MiniDFSCluster.HDFS_MINIDFS_BASEDIR, baseDir.getAbsolutePath());
 
+		// ====================================================================
+		// Resource-reduction settings to maximize DataNode count.
+		// Machine limits: ulimit -u 31314, ulimit -n 1024
+		// Each DN spawns ~10-15 threads (with these settings) and ~5-8 FDs.
+		// ====================================================================
+
+		// --- Disable all background scanners (saves 2-4 threads per DN) ---
+		conf.setLong("dfs.block.scanner.volume.bytes.per.second", 0);
+		conf.setLong("dfs.datanode.directoryscan.interval", -1);
+
+		// --- Minimize handler / transfer threads per DN ---
+		conf.setInt("dfs.datanode.handler.count", 1);          // IPC handlers (default 10)
+		conf.setInt("dfs.datanode.max.transfer.threads", 1);    // Xceiver threads (default 4096)
+
+		// --- Minimize NameNode threads ---
+		conf.setInt("dfs.namenode.handler.count", 2);
+		conf.setInt("dfs.namenode.service.handler.count", 1);
+		conf.setInt("dfs.namenode.lifeline.handler.count", 1);
+
+		// --- Reduce heartbeat / replication overhead ---
+		conf.setLong("dfs.heartbeat.interval", 30);             // less frequent heartbeats
+		conf.setInt("dfs.replication", 1);                       // single replica
+		conf.setInt("dfs.namenode.replication.min", 1);
+
+		// --- Reduce Jetty / HTTP threads per DN ---
+		conf.setInt("dfs.datanode.http.internal-proxy.port", 0);
+
+		// --- Avoid forking 'du' shell process per volume (the OOM trigger!) ---
+		// Set a very long refresh interval so DU doesn't spawn threads frequently.
+		conf.setLong("fs.du.interval", 600_000_000);  // ~7 days (effectively disabled)
+		// Also reduce the CachingGetSpaceUsed jitter
+		conf.setLong("fs.getspaceused.jitterMillis", 0);
+
+		// --- Storage: 1 dir per DN (halves FD usage vs default 2) ---
 		MiniDFSCluster.Builder builder = new MiniDFSCluster.Builder(conf);
 		builder.numDataNodes(numDataNodes);
+		builder.storagesPerDatanode(1);
 		MiniDFSCluster cluster = null;
 		try {
 			cluster = builder.build();

@@ -15,6 +15,23 @@
 
 set -euo pipefail
 
+# ============================================================================
+# CLEANUP TRAP - Stop any running experiments on Ctrl+C
+# ============================================================================
+cleanup() {
+    echo ""
+    echo "Caught interrupt, cleaning up..."
+    # Kill any child processes (sub-experiments)
+    pkill -P $$ 2>/dev/null || true
+    # Stop memory monitor if running
+    if [ -f "$EXPERIMENT_DIR/memory_monitor/monitor.pid" ] 2>/dev/null; then
+        kill $(cat "$EXPERIMENT_DIR/memory_monitor/monitor.pid") 2>/dev/null || true
+    fi
+    echo "Cleanup complete. Partial results may be in: $EXPERIMENT_DIR"
+    exit 1
+}
+trap cleanup SIGINT SIGTERM
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXPERIMENT=${1:-all}
 
@@ -44,7 +61,7 @@ SUMMARY_FILE="$EXPERIMENT_DIR/SUMMARY.md"
 HADOOP_HOME=${HADOOP_HOME:-/home/mostufa.j/hadoop}
 HADOOP_DATA_BASE=${HADOOP_DATA_BASE:-/home/mostufa.j/hadoop_data}
 MASTER_NODE=${MASTER_NODE:-tapuz14}
-WORKER_NODES=("tapuz13")
+WORKER_NODES=("tapuz12" "tapuz13")
 
 # Experiment parameters (adjust based on your cluster)
 BLOCK_SCALING_MAX_BLOCKS=${BLOCK_SCALING_MAX_BLOCKS:-50000}

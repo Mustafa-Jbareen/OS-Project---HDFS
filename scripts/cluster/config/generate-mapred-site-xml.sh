@@ -29,45 +29,47 @@ cat > "$OUTPUT_DIR/mapred-site.xml" <<EOF
     <name>mapreduce.reduce.env</name>
     <value>HADOOP_MAPRED_HOME=$HADOOP_HOME</value>
   </property>
-  <!-- Memory per map task - needs enough heap for WordCount -->
+  
+  <!-- Memory per map task - optimized for 4-core nodes with ~8GB RAM -->
+  <!-- Reduced to 100MB to allow 64 parallel tasks per node (6400MB / 100MB) -->
   <property>
     <name>mapreduce.map.memory.mb</name>
-    <value>1536</value>
+    <value>100</value>
   </property>
   <property>
     <name>mapreduce.map.java.opts</name>
-    <value>-Xmx1280m</value>
+    <value>-Xmx80m</value>
   </property>
   <property>
     <name>mapreduce.reduce.memory.mb</name>
-    <value>2048</value>
+    <value>100</value>
   </property>
   <property>
     <name>mapreduce.reduce.java.opts</name>
-    <value>-Xmx1536m</value>
+    <value>-Xmx80m</value>
   </property>
   <!-- JVM reuse: run multiple tasks per JVM to reduce startup overhead -->
   <property>
     <name>mapreduce.job.jvm.numtasks</name>
     <value>-1</value>
   </property>
-  <!-- Increase AM memory for jobs with many tasks -->
+  <!-- AppMaster memory -->
   <property>
     <name>yarn.app.mapreduce.am.resource.mb</name>
-    <value>2048</value>
+    <value>100</value>
   </property>
   <property>
     <name>yarn.app.mapreduce.am.command-opts</name>
-    <value>-Xmx1536m</value>
+    <value>-Xmx80m</value>
   </property>
-  <!-- Sort settings -->
+  <!-- Sort settings - optimized for extreme parallelism (64 tasks) -->
   <property>
     <name>mapreduce.task.io.sort.mb</name>
-    <value>128</value>
+    <value>16</value>
   </property>
   <property>
     <name>mapreduce.task.io.sort.factor</name>
-    <value>48</value>
+    <value>256</value>
   </property>
   <!-- Speculative execution off to save resources -->
   <property>

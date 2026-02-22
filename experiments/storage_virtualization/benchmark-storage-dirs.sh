@@ -16,6 +16,21 @@
 
 set -euo pipefail
 
+# ============================================================================
+# CLEANUP TRAP - Ensure cluster is in good state on exit
+# ============================================================================
+cleanup() {
+    echo ""
+    echo "Caught interrupt, cleaning up..."
+    # Kill any child processes
+    pkill -P $$ 2>/dev/null || true
+    # Clean up temp files
+    rm -f /tmp/test_write.bin /tmp/test_read.bin /tmp/hdfs-site-multivol.xml 2>/dev/null || true
+    echo "Cleanup complete."
+    exit 1
+}
+trap cleanup SIGINT SIGTERM
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_DIR="$SCRIPT_DIR/results"
 mkdir -p "$RESULTS_DIR"
@@ -35,7 +50,7 @@ HADOOP_HOME=${HADOOP_HOME:-/home/mostufa.j/hadoop}
 HADOOP_DATA_BASE=${HADOOP_DATA_BASE:-/home/mostufa.j/hadoop_data}
 
 # Worker nodes
-WORKER_NODES=("tapuz13")
+WORKER_NODES=("tapuz12" "tapuz13")
 MASTER_NODE="tapuz14"
 
 log() {
@@ -194,9 +209,31 @@ measure_block_report_time() {
 
 get_namenode_heap() {
     # Get NameNode heap usage from JMX
-    local JMX_DATA=$(curl -s "http://${MASTER_NODE}:9870/jmx" 2>/dev/null || echo "{}")
-    local HEAP_USED=$(echo "$JMX_DATA" | grep -o '"HeapMemoryUsage"[^}]*' | grep -o '"used":[0-9]*' | cut -d: -f2 || echo "0")
-    echo $((HEAP_USED / 1024 / 1024))
+    local JMX_DATA=$(curl -sL --connect-timeout 5 "http://${MASTER_NODE}:9870/jmx" 2>/dev/null || echo "{}")
+    
+    if command -v python3 &>/dev/null; then
+        local HEAP_USED=$(echo "$JMX_DATA" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for bean in data.get('beans', []):
+        if bean.get('name') == 'java.lang:type=Memory':
+            print(bean.get('HeapMemoryUsage', {}).get('used', 0))
+            break
+    else:
+        print(0)
+except:
+    print(0)
+" 2>/dev/null || echo "0")
+    else
+        local HEAP_USED=$(echo "$JMX_DATA" | grep -o '"HeapMemoryUsage"[^}]*' | grep -o '"used":[0-9]*' | cut -d: -f2 || echo "0")
+    fi
+    
+    if [ "$HEAP_USED" -gt 0 ] 2>/dev/null; then
+        echo $((HEAP_USED / 1024 / 1024))
+    else
+        echo "0"
+    fi
 }
 
 # ============================================================================

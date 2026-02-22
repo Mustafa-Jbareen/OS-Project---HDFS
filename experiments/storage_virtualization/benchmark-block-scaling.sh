@@ -10,11 +10,29 @@
 # CONCEPT: More blocks = more metadata = more NameNode memory
 #          This helps understand scalability limits.
 #
-# USAGE: bash benchmark-block-scaling.sh [max_blocks]
+# USAGE: bash benchmark-block-scaling.sh [max_blocks] [block_size]
 # OUTPUT: CSV with block_count, heap_mb, block_report_ms, ls_latency_ms
 ################################################################################
 
 set -euo pipefail
+
+# ============================================================================
+# CLEANUP TRAP - Kill all child processes on exit (Ctrl+C, error, etc.)
+# ============================================================================
+CHILD_PIDS=()
+cleanup() {
+    echo ""
+    echo "Caught interrupt, cleaning up..."
+    # Kill any background processes we started
+    for pid in "${CHILD_PIDS[@]}"; do
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    # Kill any hdfs processes we might have spawned
+    pkill -P $$ 2>/dev/null || true
+    echo "Cleanup complete."
+    exit 1
+}
+trap cleanup SIGINT SIGTERM
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_DIR="$SCRIPT_DIR/results"
@@ -37,9 +55,32 @@ log() {
 }
 
 get_namenode_heap() {
-    local JMX_DATA=$(curl -s "http://${MASTER_NODE}:9870/jmx" 2>/dev/null || echo "{}")
-    local HEAP_USED=$(echo "$JMX_DATA" | grep -o '"HeapMemoryUsage"[^}]*' | grep -o '"used":[0-9]*' | cut -d: -f2 || echo "0")
-    echo $((HEAP_USED / 1024 / 1024))
+    local JMX_DATA=$(curl -sL --connect-timeout 5 "http://${MASTER_NODE}:9870/jmx" 2>/dev/null || echo "{}")
+    
+    # Use Python for reliable JSON parsing
+    if command -v python3 &>/dev/null; then
+        local HEAP_USED=$(echo "$JMX_DATA" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for bean in data.get('beans', []):
+        if bean.get('name') == 'java.lang:type=Memory':
+            print(bean.get('HeapMemoryUsage', {}).get('used', 0))
+            break
+    else:
+        print(0)
+except:
+    print(0)
+" 2>/dev/null || echo "0")
+    else
+        local HEAP_USED=$(echo "$JMX_DATA" | grep -o '"HeapMemoryUsage"[^}]*' | grep -o '"used":[0-9]*' | cut -d: -f2 || echo "0")
+    fi
+    
+    if [ "$HEAP_USED" -gt 0 ] 2>/dev/null; then
+        echo $((HEAP_USED / 1024 / 1024))
+    else
+        echo "0"
+    fi
 }
 
 get_block_count() {
@@ -129,21 +170,33 @@ for TARGET in "${BLOCK_TARGETS[@]}"; do
     
     log "Creating $FILES_TO_CREATE files (each creates 1 block)..."
     
-    # Create files in batches for efficiency
-    BATCH_SIZE=100
+    # Create files in smaller batches with proper process management
+    # Using smaller batch size to avoid zombie processes
+    BATCH_SIZE=10
     for ((i=0; i<FILES_TO_CREATE; i+=BATCH_SIZE)); do
         BATCH_END=$((i + BATCH_SIZE))
         if [ "$BATCH_END" -gt "$FILES_TO_CREATE" ]; then
             BATCH_END=$FILES_TO_CREATE
         fi
         
+        # Clear PID tracking
+        BATCH_PIDS=()
+        
         # Generate batch of small files
         for ((j=i; j<BATCH_END; j++)); do
             FILE_NUM=$((CURRENT_FILES + j))
-            dd if=/dev/urandom bs=$BLOCK_SIZE count=1 2>/dev/null | \
-                hdfs dfs -D dfs.blocksize=$BLOCK_SIZE -put - /block_test/file_${FILE_NUM}.bin 2>/dev/null &
+            # Create temp file first, then upload (more reliable)
+            TEMP_FILE=$(mktemp)
+            dd if=/dev/urandom of="$TEMP_FILE" bs=$BLOCK_SIZE count=1 2>/dev/null
+            hdfs dfs -D dfs.blocksize=$BLOCK_SIZE -put -f "$TEMP_FILE" /block_test/file_${FILE_NUM}.bin 2>/dev/null &
+            BATCH_PIDS+=($!)
+            rm -f "$TEMP_FILE"
         done
-        wait
+        
+        # Wait for all batch processes with timeout
+        for pid in "${BATCH_PIDS[@]}"; do
+            wait "$pid" 2>/dev/null || true
+        done
         
         printf "\r  Progress: %d/%d files" "$BATCH_END" "$FILES_TO_CREATE"
     done
