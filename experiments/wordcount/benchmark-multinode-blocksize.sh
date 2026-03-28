@@ -3,13 +3,13 @@
 # SCRIPT: benchmark-multinode-blocksize.sh
 # DESCRIPTION: Comprehensive benchmark that tests WordCount performance across:
 #              - Different node counts (2, 3, 4, 5 nodes)
-#              - Different block sizes (128MB to 4GB)
-#              - Fixed input size (5GB)
+#              - Different block sizes (16MB to 4GB)
+#              - Fixed input size (20GB)
 #
-# This script reconfigures the cluster for each node count, then runs
-# WordCount with various block sizes.
+# Each configuration is run K times and the average runtime is recorded.
 #
-# USAGE: bash benchmark-multinode-blocksize.sh
+# USAGE: bash benchmark-multinode-blocksize.sh [K]
+#        K = number of repetitions per configuration (default: 5)
 # OUTPUT: results/multinode-benchmark/run_<timestamp>/ with CSV and plots
 ################################################################################
 
@@ -22,6 +22,16 @@ TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 RUN_DIR="$RESULTS_BASE/run_$TIMESTAMP"
 
 mkdir -p "$RUN_DIR"
+
+# ============================================================================
+# REPETITIONS (K runs per configuration)
+# ============================================================================
+K=${1:-5}  # Number of times to repeat each (node_count, block_size) combo
+
+if (( K < 1 )); then
+    echo "ERROR: K must be >= 1 (got $K)" >&2
+    exit 1
+fi
 
 # ============================================================================
 # CONFIGURATION
@@ -152,11 +162,9 @@ generate_and_upload_input() {
     bash "$SCRIPT_DIR/generate-input.sh" "$size_mb" "$block_size" 2>/dev/null
 }
 
-# Run WordCount and return runtime
+# Run WordCount and return runtime (output dir must be removed before calling)
 run_wordcount() {
     local start_time=$(date +%s.%N)
-    
-    hdfs dfs -rm -r -f /user/$USER/wordcount/output 2>/dev/null || true
     
     hadoop jar "$HADOOP_HOME/share/hadoop/mapreduce/hadoop-mapreduce-examples-"*.jar \
         wordcount \
@@ -176,17 +184,14 @@ echo "Multi-Node Block Size Benchmark"
 echo "=============================================="
 echo "Run ID: $TIMESTAMP"
 echo "Input size: ${INPUT_SIZE_GB}GB"
+echo "Repetitions per config (K): $K"
 echo "Node counts: ${NODE_COUNTS[*]}"
-echo "Block sizes: 128MB, 256MB, 512MB, 1GB, 2GB, 4GB"
-echo "Results: $RUN_DIR"
-echo "=============================================="
-echo ""
-
-# Save metadata
+echo "Block sizes: 16MB to 4GB"
 cat > "$RUN_DIR/metadata.json" <<EOF
 {
     "run_id": "$TIMESTAMP",
     "input_size_gb": $INPUT_SIZE_GB,
+    "repetitions_k": $K,
     "node_counts": [$(IFS=,; echo "${NODE_COUNTS[*]}")],
     "block_size_exponents": [$(IFS=,; echo "${BLOCK_SIZE_EXPONENTS[*]}")],
     "master_node": "$MASTER_NODE",
@@ -195,8 +200,37 @@ cat > "$RUN_DIR/metadata.json" <<EOF
 }
 EOF
 
-# Initialize combined CSV
-echo "node_count,block_size_exp,block_size_bytes,block_size_human,runtime_seconds" > "$COMBINED_CSV"
+# Initialize combined CSV (stores per-run data AND averages)
+echo "node_count,block_size_exp,block_size_bytes,block_size_human,avg_runtime_seconds,stddev_runtime,individual_runtimes" > "$COMBINED_CSV"
+
+# ============================================================================
+# Helper: compute average and stddev using bc
+# ============================================================================
+compute_avg() {
+    local -n arr=$1
+    local sum=0
+    local n=${#arr[@]}
+    for v in "${arr[@]}"; do
+        sum=$(echo "$sum + $v" | bc)
+    done
+    echo "scale=2; $sum / $n" | bc
+}
+
+compute_stddev() {
+    local -n arr=$1
+    local avg=$2
+    local n=${#arr[@]}
+    if (( n < 2 )); then
+        echo "0"
+        return
+    fi
+    local sum_sq=0
+    for v in "${arr[@]}"; do
+        local diff=$(echo "$v - $avg" | bc)
+        sum_sq=$(echo "$sum_sq + ($diff * $diff)" | bc)
+    done
+    echo "scale=2; sqrt($sum_sq / ($n - 1))" | bc
+}
 
 # Run benchmarks for each node count
 for node_count in "${NODE_COUNTS[@]}"; do
@@ -207,7 +241,7 @@ for node_count in "${NODE_COUNTS[@]}"; do
     
     # Create per-node-count CSV
     NODE_CSV="$RUN_DIR/results_${node_count}nodes.csv"
-    echo "block_size_exp,block_size_bytes,block_size_human,runtime_seconds" > "$NODE_CSV"
+    echo "block_size_exp,block_size_bytes,block_size_human,avg_runtime_seconds,stddev_runtime,individual_runtimes" > "$NODE_CSV"
     
     # Reconfigure cluster
     reconfigure_cluster $node_count
@@ -220,17 +254,32 @@ for node_count in "${NODE_COUNTS[@]}"; do
         log "  Block Size: $human_size (2^$exp = $block_size bytes)"
         log "  ------------------------------------------------"
         
-        # Generate and upload input
+        # Generate and upload input (once per block size)
         generate_and_upload_input $INPUT_SIZE_GB $block_size
         
-        # Run WordCount
-        log "  Running WordCount..."
-        runtime=$(run_wordcount)
-        log "  Runtime: ${runtime}s"
+        # Run WordCount K times and collect runtimes
+        declare -a runtimes=()
+        for ((run_i=1; run_i<=K; run_i++)); do
+            log "  Run $run_i/$K ..."
+            # Remove output from previous run
+            hdfs dfs -rm -r -f /user/$USER/wordcount/output 2>/dev/null || true
+            runtime=$(run_wordcount)
+            log "    Runtime: ${runtime}s"
+            runtimes+=("$runtime")
+        done
+        
+        # Compute average and stddev
+        avg=$(compute_avg runtimes)
+        stddev=$(compute_stddev runtimes "$avg")
+        individual=$(IFS=";"; echo "${runtimes[*]}")
+        
+        log "  Average: ${avg}s  StdDev: ${stddev}s  (runs: $individual)"
         
         # Record results
-        echo "$exp,$block_size,$human_size,$runtime" >> "$NODE_CSV"
-        echo "$node_count,$exp,$block_size,$human_size,$runtime" >> "$COMBINED_CSV"
+        echo "$exp,$block_size,$human_size,$avg,$stddev,$individual" >> "$NODE_CSV"
+        echo "$node_count,$exp,$block_size,$human_size,$avg,$stddev,$individual" >> "$COMBINED_CSV"
+        
+        unset runtimes
     done
     
     log ""
@@ -261,8 +310,8 @@ echo "  - metadata.json: Run configuration"
 echo "  - benchmark.log: Detailed log"
 echo ""
 echo "Generate plots with:"
-echo "  python3 $SCRIPT_DIR/plot-multinode-results.py $RUN_DIR"
-echo "=============================================="
+echo "  python3 $SCRIPT_DIR/plot-multinode-results.py $RUN_DIR"echo ""
+echo "Each config was run $K times; CSV contains averaged results."echo "=============================================="
 
 # Create symlink to latest
 ln -sfn "$RUN_DIR" "$RESULTS_BASE/latest"

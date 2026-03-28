@@ -68,18 +68,38 @@ echo "        $USER  soft  nofile  65536"
 echo "        $USER  hard  nofile  65536"
 echo ""
 
-# Use large heap + reduced thread stack size to allow more native threads.
-# -Xss128k:  128KB per thread (default 1024KB); saves ~900KB per thread.
-#            With 31k thread limit: 31k × 128KB = 4GB stack vs 31GB default.
-# -XX:+UseG1GC -XX:ParallelGCThreads=2: minimize GC background threads.
+# ===================== JVM FLAGS EXPLAINED =====================
+# -Xmx16g:  16 GB max heap. At 4096 DNs each DN holds ~1-2 MiB of
+#           metadata objects in heap; NameNode block maps add more.
+# -Xms4g:   Pre-allocate 4 GB to avoid repeated heap expansion.
+# -Xss256k: 256 KB stack per thread (default 1 MB).
+#           At ~20k threads: 20k x 256KB = 5 GB stack space.
+#           With default 1 MB: 20k x 1 MB = 20 GB -- won't fit.
+# -XX:+UseG1GC + reduced parallelism: fewer GC background threads.
+# -XX:-ShrinkHeapInSteps: prevent G1GC from de-committing heap
+#           between iterations, which causes totalMemory() to shrink
+#           and creates misleading memory-dip measurements.
 # -XX:CICompilerCount=2: reduce JIT compiler threads.
-java -Xmx8g -Xms2g \
-    -Xss512k \
+# -Dio.netty.eventLoopThreads=1:
+#   Caps every Netty NioEventLoopGroup in the JVM to 1 thread.
+#   Without this, each DataNode's HTTP server spawns 2xCPU threads (e.g. 16
+#   on 8 cores) via Netty, causing EAGAIN/pthread_create failures at scale.
+#   At 4096 DNs without this flag: 4096 x 16 = 65536 Netty threads alone!
+# -Dio.netty.allocator.type=unpooled:
+#   Disable Netty's PooledByteBufAllocator per-thread caches.
+# ================================================================
+java -Xmx16g -Xms4g \
+    -Xss256k \
     -XX:+UseG1GC \
     -XX:ParallelGCThreads=2 \
     -XX:CICompilerCount=2 \
     -XX:ConcGCThreads=1 \
+    -XX:-ShrinkHeapInSteps \
+    -XX:MaxGCPauseMillis=500 \
     -Djdk.virtualThreadScheduler.parallelism=1 \
+    -Dio.netty.eventLoopThreads=1 \
+    -Dio.netty.recycler.maxCapacityPerThread=0 \
+    -Dio.netty.allocator.type=unpooled \
     -jar "$JAR_FILE" \
     "$MAX_DATANODES" \
     "$RUN_DIR/memory_usage.csv"

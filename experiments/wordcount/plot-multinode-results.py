@@ -3,9 +3,12 @@
 Plot Multi-Node WordCount Benchmark Results
 
 Generates multiple visualizations:
-1. Combined chart with all node counts as different lines
+1. Combined chart with all node counts as different lines (with error bars)
 2. Separate charts for each node count
 3. Heatmap of runtime vs nodes vs block size
+
+CSV format (produced by benchmark-multinode-blocksize.sh):
+  node_count,block_size_exp,block_size_bytes,block_size_human,avg_runtime_seconds,stddev_runtime,individual_runtimes
 
 Usage:
     python3 plot-multinode-results.py <results_directory>
@@ -29,8 +32,8 @@ except ImportError as exc:
 
 
 def read_combined_results(csv_path: Path):
-    """Read the combined results CSV."""
-    results = {}  # {node_count: [(block_size_human, runtime), ...]}
+    """Read the combined results CSV with averaged data."""
+    results = {}  # {node_count: [(block_size_human, avg_runtime, stddev), ...]}
     
     with csv_path.open() as f:
         reader = csv.DictReader(f)
@@ -38,13 +41,21 @@ def read_combined_results(csv_path: Path):
             node_count = int(row['node_count'])
             block_size_human = row['block_size_human']
             try:
-                runtime = float(row['runtime_seconds'])
-            except ValueError:
-                continue  # Skip failed runs
+                avg_runtime = float(row['avg_runtime_seconds'])
+            except (ValueError, KeyError):
+                # Fallback for old single-run CSV format
+                try:
+                    avg_runtime = float(row.get('runtime_seconds', '0'))
+                except ValueError:
+                    continue
+            try:
+                stddev = float(row.get('stddev_runtime', '0'))
+            except (ValueError, TypeError):
+                stddev = 0.0
             
             if node_count not in results:
                 results[node_count] = []
-            results[node_count].append((block_size_human, runtime))
+            results[node_count].append((block_size_human, avg_runtime, stddev))
     
     return results
 
@@ -58,16 +69,23 @@ def read_node_results(csv_path: Path):
         for row in reader:
             block_size_human = row['block_size_human']
             try:
-                runtime = float(row['runtime_seconds'])
-            except ValueError:
-                continue
-            results.append((block_size_human, runtime))
+                avg_runtime = float(row['avg_runtime_seconds'])
+            except (ValueError, KeyError):
+                try:
+                    avg_runtime = float(row.get('runtime_seconds', '0'))
+                except ValueError:
+                    continue
+            try:
+                stddev = float(row.get('stddev_runtime', '0'))
+            except (ValueError, TypeError):
+                stddev = 0.0
+            results.append((block_size_human, avg_runtime, stddev))
     
     return results
 
 
 def plot_combined(results: dict, output_path: Path):
-    """Create combined chart with all node counts as different lines."""
+    """Create combined chart with all node counts as different lines + error bars."""
     plt.figure(figsize=(12, 8))
     
     colors = cm.viridis(np.linspace(0, 0.8, len(results)))
@@ -76,13 +94,17 @@ def plot_combined(results: dict, output_path: Path):
     for idx, (node_count, data) in enumerate(sorted(results.items())):
         block_sizes = [d[0] for d in data]
         runtimes = [d[1] for d in data]
+        stddevs = [d[2] for d in data]
         
-        plt.plot(
+        plt.errorbar(
             range(len(block_sizes)), runtimes,
+            yerr=stddevs,
             marker=markers[idx % len(markers)],
             color=colors[idx],
             linewidth=2,
             markersize=10,
+            capsize=4,
+            capthick=1.5,
             label=f'{node_count} nodes'
         )
     
@@ -92,8 +114,8 @@ def plot_combined(results: dict, output_path: Path):
     
     plt.xticks(range(len(block_sizes)), block_sizes, rotation=45, ha='right')
     plt.xlabel('Block Size', fontsize=12)
-    plt.ylabel('Runtime (seconds)', fontsize=12)
-    plt.title('WordCount Performance: Block Size vs Runtime\n(5GB Input, Varying Node Count)', fontsize=14)
+    plt.ylabel('Average Runtime (seconds)', fontsize=12)
+    plt.title('WordCount Performance: Block Size vs Runtime\n(20GB Input, K-run Average, Varying Node Count)', fontsize=14)
     plt.legend(loc='best', fontsize=10)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -110,14 +132,16 @@ def plot_individual(results: dict, output_dir: Path):
         
         block_sizes = [d[0] for d in data]
         runtimes = [d[1] for d in data]
+        stddevs = [d[2] for d in data]
         
-        bars = plt.bar(range(len(block_sizes)), runtimes, color='steelblue', alpha=0.8)
+        bars = plt.bar(range(len(block_sizes)), runtimes, yerr=stddevs,
+                       color='steelblue', alpha=0.8, capsize=4)
         
         # Add value labels on bars
-        for bar, runtime in zip(bars, runtimes):
+        for bar, runtime, sd in zip(bars, runtimes, stddevs):
             plt.text(
                 bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + max(runtimes) * 0.02,
+                bar.get_height() + sd + max(runtimes) * 0.02,
                 f'{runtime:.1f}s',
                 ha='center',
                 fontsize=9
@@ -125,8 +149,8 @@ def plot_individual(results: dict, output_dir: Path):
         
         plt.xticks(range(len(block_sizes)), block_sizes, rotation=45, ha='right')
         plt.xlabel('Block Size', fontsize=12)
-        plt.ylabel('Runtime (seconds)', fontsize=12)
-        plt.title(f'WordCount Performance with {node_count} Nodes\n(5GB Input)', fontsize=14)
+        plt.ylabel('Average Runtime (seconds)', fontsize=12)
+        plt.title(f'WordCount Performance with {node_count} Nodes\n(20GB Input, K-run Average)', fontsize=14)
         plt.grid(True, axis='y', alpha=0.3)
         plt.tight_layout()
         
@@ -137,7 +161,7 @@ def plot_individual(results: dict, output_dir: Path):
 
 
 def plot_heatmap(results: dict, output_path: Path):
-    """Create a heatmap showing runtime vs nodes and block size."""
+    """Create a heatmap showing average runtime vs nodes and block size."""
     # Prepare data matrix
     node_counts = sorted(results.keys())
     block_sizes = [d[0] for d in list(results.values())[0]]
@@ -145,8 +169,8 @@ def plot_heatmap(results: dict, output_path: Path):
     data_matrix = np.zeros((len(node_counts), len(block_sizes)))
     
     for i, node_count in enumerate(node_counts):
-        for j, (_, runtime) in enumerate(results[node_count]):
-            data_matrix[i, j] = runtime
+        for j, (_, avg_runtime, _) in enumerate(results[node_count]):
+            data_matrix[i, j] = avg_runtime
     
     plt.figure(figsize=(12, 6))
     
@@ -165,7 +189,7 @@ def plot_heatmap(results: dict, output_path: Path):
     
     plt.xlabel('Block Size', fontsize=12)
     plt.ylabel('Node Count', fontsize=12)
-    plt.title('WordCount Runtime Heatmap\n(5GB Input, Runtime in Seconds)', fontsize=14)
+    plt.title('WordCount Average Runtime Heatmap\n(20GB Input, K-run Average)', fontsize=14)
     plt.tight_layout()
     
     plt.savefig(output_path, dpi=150)
