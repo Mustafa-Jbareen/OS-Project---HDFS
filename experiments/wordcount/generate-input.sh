@@ -15,7 +15,7 @@ set -euo pipefail
 SIZE_MB=${1:-100}
 BLOCK_SIZE=${2:-0}
 
-LOCAL_FILE=/tmp/wordcount_${SIZE_MB}MB.txt
+LOCAL_FILE=/scratch/tmp/wordcount_${SIZE_MB}MB.txt
 HDFS_INPUT=/user/$USER/wordcount/input
 
 # ============================================================================
@@ -26,12 +26,16 @@ HDFS_INPUT=/user/$USER/wordcount/input
 # For 500GB: ~8-10 minutes instead of ~10+ hours.
 # ============================================================================
 
-SEED_FILE=/tmp/wordcount_seed_1MB.txt
+SEED_FILE=/scratch/tmp/wordcount_seed_1MB.txt
 SEED_SIZE_MB=1
 
 generate_seed_file() {
     echo "Creating 1MB seed file..."
-    
+
+    # Ensure directory exists with proper permissions
+    sudo mkdir -p /scratch/tmp
+    sudo chmod 777 /scratch/tmp
+
     # Base text block (~1KB) - simple words for WordCount
     # Using repetitive patterns that are quick to generate
     local TEXT_BLOCK="the quick brown fox jumps over the lazy dog
@@ -65,57 +69,52 @@ map reduce shuffle sort partition combiner input split task
 generate_large_file_fast() {
     local TARGET_MB=$1
     local OUTPUT_FILE=$2
-    
+
     echo "Generating ${TARGET_MB}MB file using fast replication..."
-    
+
     # For small files (<= 10MB), just use the seed directly
     if (( TARGET_MB <= SEED_SIZE_MB )); then
         head -c "${TARGET_MB}M" "$SEED_FILE" > "$OUTPUT_FILE"
         return
     fi
-    
-    # Calculate number of full 1MB blocks
-    local BLOCKS=$TARGET_MB
-    
-    # Use dd to replicate seed file (fastest method)
-    # Reading from seed file and writing BLOCKS copies
-    echo "Replicating seed file ${BLOCKS} times..."
-    
-    # Method: Create file by concatenating seed file multiple times
-    # Using dd for speed with large block size
-    rm -f "$OUTPUT_FILE"
-    
-    # For very large files (>1GB), show progress
-    if (( TARGET_MB > 1024 )); then
-        # Use pv if available for progress, otherwise dd with status
-        if command -v pv &> /dev/null; then
-            yes | head -n $BLOCKS | while read; do cat "$SEED_FILE"; done | pv -s "${TARGET_MB}M" > "$OUTPUT_FILE"
-        else
-            # Batch approach: write in 1GB chunks for better performance
-            local GB_CHUNKS=$((TARGET_MB / 1024))
-            local REMAINING_MB=$((TARGET_MB % 1024))
-            
-            for ((g=0; g<GB_CHUNKS; g++)); do
-                echo "  Writing GB $((g+1))/${GB_CHUNKS}..."
-                for ((i=0; i<1024; i++)); do
-                    cat "$SEED_FILE"
-                done >> "$OUTPUT_FILE"
-            done
-            
-            if (( REMAINING_MB > 0 )); then
-                echo "  Writing remaining ${REMAINING_MB}MB..."
-                for ((i=0; i<REMAINING_MB; i++)); do
-                    cat "$SEED_FILE"
-                done >> "$OUTPUT_FILE"
-            fi
-        fi
-    else
-        # For files <= 1GB, simple concatenation
-        for ((i=0; i<BLOCKS; i++)); do
+
+    # FAST METHOD: Create 1GB chunk first, then replicate with dd
+    local CHUNK_FILE="/scratch/tmp/wordcount_chunk_1GB.txt"
+    local CHUNK_SIZE_MB=1024
+
+    # Create 1GB chunk if it doesn't exist or is wrong size
+    if [[ ! -f "$CHUNK_FILE" ]] || (( $(stat -c%s "$CHUNK_FILE" 2>/dev/null || echo 0) != CHUNK_SIZE_MB * 1024 * 1024 )); then
+        echo "  Creating 1GB chunk file (one-time)..."
+        rm -f "$CHUNK_FILE"
+        # Use dd to replicate seed file 1024 times efficiently
+        for ((i=0; i<CHUNK_SIZE_MB; i++)); do
             cat "$SEED_FILE"
-        done > "$OUTPUT_FILE"
+        done > "$CHUNK_FILE"
+        echo "  1GB chunk ready."
     fi
-    
+
+    # Calculate GB chunks and remainder
+    local GB_CHUNKS=$((TARGET_MB / CHUNK_SIZE_MB))
+    local REMAINING_MB=$((TARGET_MB % CHUNK_SIZE_MB))
+
+    rm -f "$OUTPUT_FILE"
+
+    # Write full GB chunks using dd (much faster than cat loop)
+    if (( GB_CHUNKS > 0 )); then
+        echo "  Writing ${GB_CHUNKS}GB using fast dd method..."
+        for ((g=0; g<GB_CHUNKS; g++)); do
+            echo -ne "  Writing GB $((g+1))/${GB_CHUNKS}...\r"
+            dd if="$CHUNK_FILE" bs=64M status=none >> "$OUTPUT_FILE"
+        done
+        echo "  Writing GB ${GB_CHUNKS}/${GB_CHUNKS}... done"
+    fi
+
+    # Write remaining MB
+    if (( REMAINING_MB > 0 )); then
+        echo "  Writing remaining ${REMAINING_MB}MB..."
+        dd if="$CHUNK_FILE" bs=1M count="$REMAINING_MB" status=none >> "$OUTPUT_FILE"
+    fi
+
     # Verify size
     local ACTUAL_SIZE=$(stat -c%s "$OUTPUT_FILE" 2>/dev/null || stat -f%z "$OUTPUT_FILE")
     echo "Generated file size: $((ACTUAL_SIZE / 1024 / 1024))MB"
@@ -165,6 +164,10 @@ echo "Output file: $LOCAL_FILE"
 echo ""
 
 START_TIME=$(date +%s)
+
+# Create directory for temporary files if it doesn't exist
+sudo mkdir -p /scratch/tmp
+sudo chmod 777 /scratch/tmp
 
 # Step 1: Create seed file if it doesn't exist
 if [[ ! -f "$SEED_FILE" ]]; then

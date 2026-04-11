@@ -33,7 +33,7 @@ mkdir -p "$RUN_DIR"
 # ============================================================================
 K_REPS=${1:-3}                      # Repetitions per config
 
-INPUT_SIZE_GB=1                    # 1GB input
+INPUT_SIZE_GB=20                    # 20GB input
 BLOCK_SIZE=$((128 * 1024 * 1024))   # 128MB in bytes
 BLOCK_SIZE_HUMAN="128MB"
 REPLICATION=3                       # Standard HDFS replication
@@ -41,7 +41,7 @@ REPLICATION=3                       # Standard HDFS replication
 # Loopback sizing policy:
 # Use a per-node loopback budget and split it across k DataNodes.
 # This keeps runs realistic even for small INPUT_SIZE_GB smoke tests.
-LOOPBACK_BUDGET_PER_NODE_GB=40
+LOOPBACK_BUDGET_PER_NODE_GB=64
 MIN_IMAGE_SIZE_GB=2
 
 # k values to test: number of DataNodes per physical node
