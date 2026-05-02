@@ -79,14 +79,15 @@ my_scripts/
 │   │   ├── plot_fixed_blocks.py           # Plot fixed-blocks results
 │   │   └── requirements.txt              # Python dependencies
 │   │
-│   ├── storage_virtualization/            # Storage virtualization research
-│   │   ├── README.md                      # Detailed experiment docs
-│   │   ├── benchmark-block-scaling.sh
-│   │   ├── benchmark-storage-dirs.sh
-│   │   ├── monitor-namenode-memory.sh
-│   │   ├── run-full-experiment.sh
-│   │   ├── simulate-virtual-storage-failure.sh
-│   │   └── plot-storage-virtualization.py
+│   ├── storage_virtualization_loopback/   # Storage virtualization (loopback FS) experiment — see Experiment 5
+│   │   ├── run-experiment-loopback-fs.sh  # Main orchestrator
+│   │   ├── start-single-dn-cluster.sh     # Start cluster with k loopback dirs per DN
+│   │   ├── stop-single-dn-cluster.sh      # Stop cluster and tear down loopbacks
+│   │   ├── generate-single-dn-configs.sh  # Generate hdfs-site.xml with k data dirs
+│   │   ├── setup-loopback-fs.sh           # Create / format / mount loopback images
+│   │   ├── teardown-loopback-fs.sh        # Unmount and remove loopback images
+│   │   ├── count-input-blocks-per-fs.sh   # Count input blocks per loopback FS on disk
+│   │   └── plot-results.py                # Generate all plots from a results directory
 │   │
 │   └── results/                           # Experiment output (gitignored)
 │
@@ -312,30 +313,136 @@ python3 experiments/mini_dfs_cluster/plot_fixed_blocks.py \
 
 ---
 
-### Experiment 5: Storage Virtualization
+### Experiment 5: Storage Virtualization (Loopback Filesystems)
 
-**Purpose**: Research the impact of virtualizing storage in HDFS DataNodes for finer-grained fault tolerance, extended flash lifespan, and software-defined failure domains.
+**Purpose**: Measure how WordCount performance, disk I/O, and NameNode memory scale as the number of loopback-backed storage directories per DataNode grows from 1 to 1024. Tests whether splitting one DataNode's storage across many virtual disks helps or hurts performance, and at what k the overhead becomes the bottleneck.
 
-See [experiments/storage_virtualization/README.md](experiments/storage_virtualization/README.md) for full documentation.
+**Design**: Cluster topology stays fixed — one DataNode process per physical node. Only `k` (the number of ext4 loopback filesystems listed in `dfs.datanode.data.dir`) varies. Each image is sized as `floor(220 GB × 1024 / k)` MB, keeping total disk use per node within 220 GB.
 
-**Sub-experiments**:
+#### Parameters
 
-| Script | What it tests |
-|--------|--------------|
-| `benchmark-block-scaling.sh` | NameNode heap growth as block count increases |
-| `benchmark-storage-dirs.sh` | DataNode performance with multiple storage directories |
-| `monitor-namenode-memory.sh` | Real-time NameNode heap monitoring via JMX |
-| `simulate-virtual-storage-failure.sh` | Failure detection and re-replication timing |
-| `run-full-experiment.sh` | Runs all sub-experiments sequentially |
+| Parameter | Value |
+|-----------|-------|
+| k values | 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 |
+| Input | 22 GB, 16 MB blocks, replication = 3 |
+| Repetitions | 5 runs per k (averaged) |
+| DataNode heap | 5 500 MB / node |
+| Loopback budget | 220 GB / node |
+
+#### Cluster topology
+
+```
+tapuz14  NameNode + ResourceManager  (no DataNode by default)
+tapuz10  DataNode + NodeManager
+tapuz11  DataNode + NodeManager
+tapuz12  DataNode + NodeManager
+tapuz13  DataNode + NodeManager
+```
+
+Set `MASTER_HAS_DN=1` to also run a DataNode on tapuz14 (5 total instead of 4).
+
+#### Storage layout (example k=4)
+
+```
+dfs.datanode.data.dir =
+  /scratch/hdfs_loop/dn1/hdfs_data,
+  /scratch/hdfs_loop/dn2/hdfs_data,
+  /scratch/hdfs_loop/dn3/hdfs_data,
+  /scratch/hdfs_loop/dn4/hdfs_data
+
+Each mount: /scratch/hdfs_loop/dnX <- loop device <- /scratch/loop_images/hdfs_dnX.img (ext4)
+```
+
+#### Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `run-experiment-loopback-fs.sh` | Main orchestrator — iterates k values, runs WordCount, collects all metrics |
+| `start-single-dn-cluster.sh <k> <img_mb> <heap_mb> <repl>` | Creates k loopbacks, generates config, starts cluster |
+| `stop-single-dn-cluster.sh <k>` | Stops Hadoop, tears down loopback filesystems |
+| `generate-single-dn-configs.sh` | Generates `hdfs-site.xml` with k comma-separated data dirs |
+| `setup-loopback-fs.sh` | Creates, formats (ext4), and mounts k image files per node |
+| `teardown-loopback-fs.sh` | Unmounts and removes loopback images |
+| `count-input-blocks-per-fs.sh` | Counts input-file blocks on disk per loopback FS (parallelised) |
+| `plot-results.py <run_dir>` | Generates all plots from a results directory |
+
+#### Running
 
 ```bash
-# Run everything
-bash experiments/storage_virtualization/run-full-experiment.sh all
+cd experiments/storage_virtualization_loopback
 
-# Individual experiments
-bash experiments/storage_virtualization/benchmark-block-scaling.sh 100000
-bash experiments/storage_virtualization/benchmark-storage-dirs.sh 64
+# Full experiment: k=1..1024, 5 repetitions each (~5-8 hours)
+bash run-experiment-loopback-fs.sh
+
+# Custom repetition count
+bash run-experiment-loopback-fs.sh 3
+
+# Plot a completed run
+python3 plot-results.py results/storage_virtualization_loopback/latest
 ```
+
+#### Metrics collected and why
+
+| Metric | Why it matters |
+|--------|---------------|
+| WordCount runtime | Primary: does more virtual dirs help or hurt MapReduce? |
+| NameNode heap (before/peak/avg) | Does metadata overhead grow with k? |
+| iostat r_await / w_await | Does disk latency rise as one physical disk serves k virtual FSes? |
+| iostat %util | Is the underlying disk saturated at high k? |
+| iostat wkB/s (cluster sum) | Does aggregate write throughput improve with more dirs? |
+| Block distribution per FS | Are blocks spread evenly across virtual dirs? |
+| Used capacity per FS | Is data volume balanced, not just block count? |
+
+#### Output CSV columns
+
+```
+k_storage_dirs, total_storage_dirs, datanodes,
+avg_runtime_seconds, stddev_runtime, individual_runtimes,
+nn_heap_before_mb, nn_heap_peak_mb, nn_heap_avg_mb, nn_block_count,
+block_counts_per_fs, input_block_counts_per_fs, fs_used_mb_per_fs
+```
+
+#### Output plots (~32 PNGs per run)
+
+**Runtime**: `runtime_vs_k.png`, `runtime_vs_total_dirs.png`, `runtime_vs_k_logscale.png`, `individual_runs.png`, `speedup_vs_k.png`
+
+**NameNode memory**: `nn_memory_vs_k.png`, `runtime_and_memory_vs_k.png`, `nn_memory_timeseries.png`
+
+**Block distribution**: `per_fs_block_distribution.png`, `input_blocks_per_fs.png`, `input_blocks_boxplot.png`, `input_blocks_balance.png`, `fs_capacity_per_node.png`, `fs_capacity_balance.png`
+
+**iostat (one file per metric)**: `iostat_latency_vs_k.png`, `iostat_util_vs_k.png`, 8× `iostat_ts_<metric>.png` (time series), 10× `iostat_node_<metric>.png` (per node/device)
+
+#### iostat measurement design
+
+- `iostat -dxyt 5` runs on all DataNode nodes throughout all repetitions for a given k.
+- Per-run wall-clock start/end is recorded in `iostat/wc_windows_k<k>.txt`.
+- Parser only includes samples whose 5 s window overlaps a WordCount run — idle time between runs is excluded.
+- Latency (`r_await`, `w_await`) uses an IOPS-weighted mean to exclude zero-traffic intervals.
+- Throughput (`wkB/s`, `r/s`, etc.) is **summed** across all devices/nodes at each timestamp (cluster total).
+
+#### Comparison with related experiments
+
+| Aspect | `loopback_datanodes` | `storage_virtualization_loopback` |
+|--------|---------------------|----------------------------------|
+| DataNodes per node | k (multiple processes) | 1 (single process) |
+| Storage dirs per DN | 1 | k (multiple loopback FSes) |
+| What it tests | DataNode process scaling | Storage virtualization scaling |
+
+#### Troubleshooting
+
+```bash
+df -h | grep hdfs_loop        # Check mounted loopback filesystems
+losetup -a | grep hdfs_dn     # Check loop device attachments
+sudo umount -l /scratch/hdfs_loop/dn*   # Force-clean stuck mounts
+sudo losetup -D
+ls /tmp/hadoop_dn_logs/hadoop-*-datanode-*.log   # DataNode logs
+```
+
+#### Known limitations
+
+- No cold-cache reset between the K repetitions within a k — later runs benefit from OS page cache; average reflects warm-cache performance.
+- If an ssh call fails during block counting, that node's counts are missing and per-FS node-color assignment in plots shifts for subsequent nodes.
+- No automatic abort if fewer DataNodes than expected register with the NameNode.
 
 ---
 
@@ -396,7 +503,7 @@ pip install matplotlib numpy
 | `plot-multinode-results.py` | Multi-node CSV (with averages) | Combined lines, per-node bars, heatmap, speedup — all with error bars |
 | `plot_memory.py` | MiniDFS memory CSV | Memory vs DataNodes (linear/log) |
 | `plot_fixed_blocks.py` | Fixed-blocks CSV | Memory vs DataNodes + Blocks/DN dual-axis; Memory vs Blocks/DN |
-| `plot-storage-virtualization.py` | Storage virtualization CSV | Various storage experiment charts |
+| `storage_virtualization_loopback/plot-results.py` | Storage virtualization run dir | ~32 plots: runtime, NN memory, block distribution, iostat I/O (one file per metric) |
 
 ---
 
@@ -443,10 +550,21 @@ results/
 │   │   └── memory_scaling_log.png
 │   └── latest -> run_...
 │
-└── fixed_blocks/
-    ├── run_2026-03-11_16-00-00/
-    │   ├── fixed_blocks_memory.csv
-    │   ├── fixed_blocks_memory_vs_dns.png
-    │   └── fixed_blocks_memory_vs_blocks_per_dn.png
+├── fixed_blocks/
+│   ├── run_2026-03-11_16-00-00/
+│   │   ├── fixed_blocks_memory.csv
+│   │   ├── fixed_blocks_memory_vs_dns.png
+│   │   └── fixed_blocks_memory_vs_blocks_per_dn.png
+│   └── latest -> run_...
+│
+└── storage_virtualization_loopback/
+    ├── run_<timestamp>/
+    │   ├── results.csv                 # One row per k: runtime + NN memory + block stats
+    │   ├── metadata.json
+    │   ├── experiment.log
+    │   ├── namenode_memory/            # Per-k NN heap time series CSVs
+    │   ├── iostat/                     # Raw logs + parsed summaries + WC windows
+    │   ├── runtime_vs_k.png            # (and ~30 more plots)
+    │   └── hdfs_fsck_k*.txt            # HDFS block info per k (debugging)
     └── latest -> run_...
 ```

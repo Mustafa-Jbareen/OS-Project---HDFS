@@ -31,16 +31,13 @@ mkdir -p "$RUN_DIR"
 # ============================================================================
 K_REPS=${1:-5}  # Number of repetitions per k value
 
-INPUT_SIZE_GB=22   # 22GB input (using /scratch with 236GB available)
-BLOCK_SIZE=$((16 * 1024 * 1024))    # 16MB in bytes
-BLOCK_SIZE_HUMAN="16MB"
+INPUT_SIZE_GB=50   # 50GB input (using /scratch with 236GB available)
+BLOCK_SIZE=$((32 * 1024 * 1024))    # 32MB in bytes (must match dfs.blocksize in generate-single-dn-configs.sh)
+BLOCK_SIZE_HUMAN="32MB"
 REPLICATION=3                       # Standard HDFS replication
 
-# k valuxes to test: number of loopback storage dirs per DataNode
-# Start at 1 and double up to 1024 reversion: 1, 2, 4, 8, ..., 1024 reversed
-K_VALUES=(1 2 4 8 16 32 64 128 256 512)
-
-# Loopback sizing policy
+# k values to test: number of loopback storage dirs per DataNode (doubling progression)
+K_VALUES=(1 2 4 8 16 32 64 128 256 512 1024)
 
 # Loopback sizing policy
 LOOPBACK_BUDGET_PER_NODE_GB=220
@@ -198,7 +195,19 @@ start_iostat_monitor() {
     IOSTAT_PIDS=()
     for node in "${DATANODE_NODES[@]}"; do
         local outfile="$IOSTAT_DIR/iostat_k${k}_${node}.log"
-        ssh "$node" "iostat -dxyt 5" > "$outfile" 2>/dev/null &
+
+        # Detect the physical block device backing /scratch on this node.
+        # Strips /dev/ prefix and trailing partition number: /dev/sda5 -> sda, /dev/sdb5 -> sdb.
+        local scratch_dev
+        scratch_dev=$(ssh "$node" \
+            "df /scratch 2>/dev/null | awk 'NR==2{print \$1}' | sed 's|.*/||;s|[0-9]*\$||'" \
+            2>/dev/null || echo "sda")
+        [[ -z "$scratch_dev" ]] && scratch_dev="sda"
+
+        log "  iostat on $node: monitoring device=${scratch_dev} (/scratch)"
+        # LANG=C forces MM/DD/YYYY HH:MM:SS AM/PM timestamp format regardless of locale.
+        # Passing the device name restricts iostat to /scratch I/O only (no OS disk noise).
+        ssh "$node" "LANG=C iostat -dxyt 5 ${scratch_dev}" > "$outfile" 2>/dev/null &
         IOSTAT_PIDS+=($!)
     done
     log "  iostat monitor started on ${#DATANODE_NODES[@]} nodes (k=$k)"
@@ -220,26 +229,59 @@ stop_iostat_monitor() {
 
 # Parse raw iostat logs into a summary CSV for a given k value.
 # Usage: parse_iostat_logs <k_value>
+#
+# Filtering: if $IOSTAT_DIR/wc_windows_k${k}.txt exists (one "start_epoch end_epoch"
+# line per WordCount run), only iostat samples whose 5 s report window overlaps a
+# WC window are kept. This drops idle cleanup time between runs so averages reflect
+# real workload I/O, not HDFS rm gaps.
 parse_iostat_logs() {
     local k=$1
     local summary_csv="$IOSTAT_DIR/iostat_summary_k${k}.csv"
 
     python3 - "$k" "$IOSTAT_DIR" <<'IOSTAT_PY' 2>/dev/null || true
 import sys, re, os, glob
+from datetime import datetime
 
 k = sys.argv[1]
 iostat_dir = sys.argv[2]
 summary_path = os.path.join(iostat_dir, f"iostat_summary_k{k}.csv")
 
-# Find all raw iostat log files for this k value
+# Load WordCount run windows (epoch seconds) if recorded by the runner.
+wc_windows = []
+windows_path = os.path.join(iostat_dir, f"wc_windows_k{k}.txt")
+if os.path.exists(windows_path):
+    with open(windows_path) as wf:
+        for line in wf:
+            parts = line.strip().split()
+            if len(parts) == 2:
+                try:
+                    wc_windows.append((int(parts[0]), int(parts[1])))
+                except ValueError:
+                    pass
+
+def in_wc_window(ts_str):
+    # No windows recorded -> include everything (backward compatible).
+    if not wc_windows:
+        return True
+    try:
+        dt = datetime.strptime(ts_str.strip(), "%m/%d/%Y %I:%M:%S %p")
+    except ValueError:
+        return True
+    ts_epoch = int(dt.timestamp())
+    # iostat -dxyt 5 averages over the prior 5 s, so the report at ts covers [ts-5, ts].
+    for s, e in wc_windows:
+        if ts_epoch - 5 <= e and ts_epoch >= s:
+            return True
+    return False
+
 pattern = os.path.join(iostat_dir, f"iostat_k{k}_*.log")
 log_files = sorted(glob.glob(pattern))
 
+kept = dropped = 0
 with open(summary_path, "w") as out:
-    out.write("timestamp,node,device,r_per_s,w_per_s,rkB_per_s,wkB_per_s,await,r_await,w_await,util\n")
+    out.write("timestamp,node,device,r_per_s,w_per_s,rkB_per_s,wkB_per_s,r_await,w_await,rareq_sz,wareq_sz,aqu_sz,util\n")
 
     for log_file in log_files:
-        # Extract node name from filename: iostat_k<k>_<node>.log
         basename = os.path.basename(log_file)
         node = basename.replace(f"iostat_k{k}_", "").replace(".log", "")
 
@@ -247,25 +289,30 @@ with open(summary_path, "w") as out:
         header_indices = {}
 
         with open(log_file) as f:
+            parts = []  # current data-line fields (set before get_col is called)
+
+            def get_col(name, default="0"):
+                idx = header_indices.get(name)
+                if idx is not None and idx < len(parts):
+                    return parts[idx]
+                return default
+
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
 
-                # Timestamp lines look like: 04/10/2026 02:15:30 PM
                 ts_match = re.match(r"(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}\s+[AP]M)", line)
                 if ts_match:
                     current_ts = ts_match.group(1)
                     continue
 
-                # Header line
                 if line.startswith("Device"):
                     cols = line.split()
                     for i, col in enumerate(cols):
                         header_indices[col] = i
                     continue
 
-                # Data line — skip loop devices, only keep real disks (sd*)
                 parts = line.split()
                 if not parts or len(parts) < 2:
                     continue
@@ -273,28 +320,22 @@ with open(summary_path, "w") as out:
                 if not device.startswith("sd"):
                     continue
 
-                def get_col(name, default="0"):
-                    idx = header_indices.get(name)
-                    if idx is not None and idx < len(parts):
-                        return parts[idx]
-                    return default
+                if not in_wc_window(current_ts):
+                    dropped += 1
+                    continue
 
                 row = [
-                    current_ts,
-                    node,
-                    device,
-                    get_col("r/s"),
-                    get_col("w/s"),
-                    get_col("rkB/s"),
-                    get_col("wkB/s"),
-                    get_col("await"),
-                    get_col("r_await"),
-                    get_col("w_await"),
-                    get_col("%util"),
+                    current_ts, node, device,
+                    get_col("r/s"), get_col("w/s"),
+                    get_col("rkB/s"), get_col("wkB/s"),
+                    get_col("r_await"), get_col("w_await"),
+                    get_col("rareq-sz"), get_col("wareq-sz"),
+                    get_col("aqu-sz"), get_col("%util"),
                 ]
                 out.write(",".join(row) + "\n")
+                kept += 1
 
-print(f"Parsed iostat summary: {summary_path}")
+print(f"Parsed iostat summary: {summary_path} (kept={kept}, dropped_outside_wc={dropped}, windows={len(wc_windows)})")
 IOSTAT_PY
 
     log "  iostat logs parsed: $summary_csv"
@@ -497,6 +538,11 @@ for k in "${K_VALUES[@]}"; do
     start_nn_monitor "$NN_MONITOR_CSV" 5
     start_iostat_monitor "$k"
 
+    # Per-run WC windows (epoch seconds). parse_iostat_logs uses this file to
+    # drop iostat samples captured during `hdfs dfs -rm` gaps between runs.
+    WC_WINDOWS_FILE="$IOSTAT_DIR/wc_windows_k${k}.txt"
+    : > "$WC_WINDOWS_FILE"
+
     # -- Step 3: Run WordCount K_REPS times --
     declare -a runtimes=()
 
@@ -504,11 +550,12 @@ for k in "${K_VALUES[@]}"; do
         log ""
         log "  Run $run_i/$K_REPS (k=$k)..."
 
-        # Remove output from previous run
+        # Remove output from previous run (outside the timed/measured window)
         hdfs dfs -rm -r -f /user/$USER/wordcount/output 2>/dev/null || true
 
         # Time the WordCount job
         START_TIME=$(date +%s.%N)
+        WC_START_EPOCH=$(date +%s)
 
         hadoop jar "$HADOOP_HOME/share/hadoop/mapreduce/hadoop-mapreduce-examples-"*.jar \
             wordcount \
@@ -517,8 +564,11 @@ for k in "${K_VALUES[@]}"; do
             /user/$USER/wordcount/input \
             /user/$USER/wordcount/output 2>&1 | tee -a "$LOG_FILE"
 
+        WC_END_EPOCH=$(date +%s)
         END_TIME=$(date +%s.%N)
         RUNTIME=$(echo "scale=2; $END_TIME - $START_TIME" | bc)
+
+        echo "$WC_START_EPOCH $WC_END_EPOCH" >> "$WC_WINDOWS_FILE"
 
         log "  Runtime: ${RUNTIME}s"
         runtimes+=("$RUNTIME")
@@ -544,20 +594,22 @@ for k in "${K_VALUES[@]}"; do
 
     # -- Step 4.5: Flush caches and stabilize before block collection --
     log "Flushing caches and stabilizing DataNode storage..."
+    # Remove WordCount output so it doesn't pollute block counts (input-only measurement)
+    hdfs dfs -rm -r -f /user/$USER/wordcount/output 2>/dev/null || true
     sleep 3  # Let async block writes complete
     for NODE in "${DATANODE_NODES[@]}"; do
         ssh "$NODE" "sync" 2>/dev/null || true
     done
     sleep 1
 
-    # Collect per-filesystem block counts (after WordCount, before cluster teardown)
+    # Collect per-filesystem block counts (after WordCount output removed, input still present)
     log "Collecting per-filesystem block counts..."
     block_counts_per_fs=""
     > "$RUN_DIR/block_counts_tmp.txt"
     for NODE in "${DATANODE_NODES[@]}"; do
-        # Count blocks in each loopback filesystem
+        # Count block DATA files only (exclude .meta checksum files; each block has both)
         # Path: /scratch/hdfs_loop/dn<i>/hdfs_data/current/BP-<pool-id>/current/.../blk_*
-        ssh "$NODE" 'for i in {1..'"$k"'}; do cnt=$(find /scratch/hdfs_loop/dn"$i"/hdfs_data -name "blk_*" -type f 2>/dev/null | wc -l); echo -n "$cnt;"; done' 2>/dev/null >> "$RUN_DIR/block_counts_tmp.txt"
+        ssh "$NODE" 'for i in {1..'"$k"'}; do cnt=$(find /scratch/hdfs_loop/dn"$i"/hdfs_data -name "blk_*" -not -name "*.meta" -type f 2>/dev/null | wc -l); echo -n "$cnt;"; done' 2>/dev/null >> "$RUN_DIR/block_counts_tmp.txt"
     done
     if [[ -f "$RUN_DIR/block_counts_tmp.txt" && -s "$RUN_DIR/block_counts_tmp.txt" ]]; then
         block_counts_per_fs=$(cat "$RUN_DIR/block_counts_tmp.txt")
@@ -720,7 +772,7 @@ PARSE_BLOCKS
 
     unset runtimes
 
-    # -- Step 5: Clean up HDFS data --
+    # -- Step 5: Clean up HDFS data (output already removed above; this clears input too) --
     log "Cleaning HDFS data..."
     hdfs dfs -rm -r -f /user/$USER/wordcount 2>/dev/null || true
 

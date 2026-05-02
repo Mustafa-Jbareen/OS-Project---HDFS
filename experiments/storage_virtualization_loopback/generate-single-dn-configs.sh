@@ -113,10 +113,13 @@ cat > "$CONFIG_DIR/hdfs-site.xml" <<EOF
     <value>0.0.0.0:9867</value>
   </property>
 
-  <!-- Block size: 128MB -->
+  <!-- Default block size: 32MB.
+       generate-input.sh passes BLOCK_SIZE as -D dfs.blocksize at write time
+       (overriding this default for input files).  WordCount output and any
+       other writes without an explicit -D flag use this 32MB default. -->
   <property>
     <name>dfs.blocksize</name>
-    <value>134217728</value>
+    <value>33554432</value>
   </property>
 
   <!-- NameNode settings -->
@@ -131,14 +134,20 @@ cat > "$CONFIG_DIR/hdfs-site.xml" <<EOF
     <value>131072</value>
   </property>
 
-  <!-- Performance optimization parameters -->
+  <!-- Performance: larger write packet for sequential bulk writes.
+       Default is 64KB; 8MB = quarter of the 32MB block size (4 packets per
+       block).  Good balance: reduces per-packet overhead vs. the default
+       while keeping pipeline stall time per hop manageable (~65ms on 1Gbps). -->
   <property>
     <name>dfs.client.write.packet.size</name>
-    <value>1073741824</value> <!-- 1GB -->
+    <value>8388608</value>
   </property>
+
+  <!-- Performance: more DataNode handler threads (default 10;
+       useful when one DN has many concurrent readers at high k) -->
   <property>
     <name>dfs.datanode.handler.count</name>
-    <value>256</value> <!-- Increase handler threads -->
+    <value>16</value>
   </property>
 </configuration>
 EOF

@@ -2,13 +2,14 @@
 """
 Plot Storage Virtualization Loopback Experiment Results
 
-Generates visualizations showing how WordCount performance changes as the
-number of storage directories (k loopback filesystems) per DataNode scales
-from 2 to 512.
+Generates visualizations showing how WordCount performance, NameNode memory,
+and disk I/O change as the number of loopback-backed storage directories per
+DataNode scales from 1 to 1024.
 
 CSV format (produced by run-experiment-loopback-fs.sh):
-    k_storage_dirs,total_storage_dirs,datanodes,avg_runtime_seconds,stddev_runtime,individual_runtimes,
-    nn_heap_before_mb,nn_heap_peak_mb,nn_heap_avg_mb,nn_block_count
+    k_storage_dirs,total_storage_dirs,datanodes,avg_runtime_seconds,stddev_runtime,
+    individual_runtimes,nn_heap_before_mb,nn_heap_peak_mb,nn_heap_avg_mb,nn_block_count,
+    block_counts_per_fs,input_block_counts_per_fs,fs_used_mb_per_fs
 
 Usage:
     python3 plot-results.py <results_directory>
@@ -18,17 +19,30 @@ Usage:
 import argparse
 import csv
 import json
+from datetime import datetime
 from pathlib import Path
 
 try:
     import matplotlib.pyplot as plt
-    import matplotlib.cm as cm
+    import matplotlib.colors as mcolors
     import numpy as np
 except ImportError as exc:
     raise SystemExit(
         "matplotlib and numpy are required. Install with:\n"
         "  pip install matplotlib numpy"
     ) from exc
+
+DPI = 200  # output resolution for all saved figures
+# Threshold: if total bars across all k groups would exceed this, use a heatmap
+# instead of a grouped bar chart (avoids thousands of unreadable slivers).
+HEATMAP_THRESHOLD = 80
+MARKERS = ["o", "s", "^", "D", "v", "P", "X", "h", "*", "d", ">", "<", "p", "H"]
+
+
+def _k_colors(n):
+    """Return n visually distinct colours. Uses tab20 for >10, tab10 otherwise."""
+    cmap = plt.colormaps["tab20"] if n > 10 else plt.colormaps["tab10"]
+    return cmap(np.linspace(0, 0.9, n))
 
 
 def read_results(csv_path: Path):
@@ -59,27 +73,62 @@ def read_results(csv_path: Path):
 # PLOT X: Per-Filesystem Block Distribution
 # ============================================================================
 def plot_per_fs_block_distribution(results, metadata, output_dir: Path):
-    """Bar plot showing block counts for each local filesystem (loopback) for each k."""
-    fig, ax = plt.subplots(figsize=(max(10, len(results)*2), 7))
-    labels = []
-    values = []
-    colors = []
-    color_map = cm.get_cmap('tab10')
-    for idx, r in enumerate(results):
-        k = r["k"]
-        counts = r.get("block_counts_per_fs", [])
-        for i, cnt in enumerate(counts):
-            labels.append(f"k={k}-fs{i+1}")
-            values.append(cnt)
-            colors.append(color_map(idx % 10))
-    ax.bar(labels, values, color=colors)
-    ax.set_ylabel("Blocks per Filesystem", fontsize=13)
-    ax.set_xlabel("Filesystem (by k and index)", fontsize=13)
-    ax.set_title("Block Distribution per Local Filesystem (All Files)", fontsize=14)
-    ax.tick_params(axis='x', rotation=45)
-    fig.tight_layout()
+    """Block counts per loopback FS for every k.
+
+    Uses a heatmap (k × FS-index) when there are too many bars to read,
+    otherwise a grouped bar chart coloured by k value.
+    """
+    valid = [r for r in results if r.get("block_counts_per_fs")]
+    if not valid:
+        return
+
+    total_bars = sum(len(r["block_counts_per_fs"]) for r in valid)
+
+    if total_bars > HEATMAP_THRESHOLD:
+        # --- Heatmap: rows = k values, columns = FS index ---
+        max_fs = max(len(r["block_counts_per_fs"]) for r in valid)
+        k_labels = [f"k={r['k']}" for r in valid]
+        matrix = np.zeros((len(valid), max_fs))
+        for i, r in enumerate(valid):
+            for j, c in enumerate(r["block_counts_per_fs"]):
+                matrix[i, j] = c
+
+        fig, ax = plt.subplots(figsize=(min(max_fs * 0.3 + 4, 22), max(5, len(valid) * 0.6 + 2)))
+        im = ax.imshow(matrix, aspect="auto", cmap="YlOrRd")
+        ax.set_yticks(range(len(k_labels)))
+        ax.set_yticklabels(k_labels, fontsize=10)
+        ax.set_xlabel("Filesystem index (across all DataNodes)", fontsize=12)
+        ax.set_ylabel("k (storage dirs per DataNode)", fontsize=12)
+        ax.set_title(
+            f"Block Distribution per Loopback FS (All Files)\n({_subtitle(metadata)})",
+            fontsize=13,
+        )
+        plt.colorbar(im, ax=ax, label="Blocks")
+        fig.tight_layout()
+    else:
+        colors = _k_colors(len(valid))
+        fig, ax = plt.subplots(figsize=(max(10, total_bars * 0.4), 7))
+        x = 0
+        for idx, r in enumerate(valid):
+            counts = r["block_counts_per_fs"]
+            xs = list(range(x, x + len(counts)))
+            ax.bar(xs, counts, color=colors[idx], edgecolor="black", linewidth=0.4,
+                   label=f"k={r['k']}")
+            ax.text(np.mean(xs), max(counts) * 1.04, f"k={r['k']}",
+                    ha="center", fontsize=9, fontweight="bold")
+            x += len(counts) + 1.5
+        ax.set_xlabel("Filesystem index", fontsize=13)
+        ax.set_ylabel("Blocks per Filesystem", fontsize=13)
+        ax.set_title(
+            f"Block Distribution per Local Filesystem (All Files)\n({_subtitle(metadata)})",
+            fontsize=13,
+        )
+        ax.legend(fontsize=9, loc="best")
+        ax.grid(True, axis="y", alpha=0.3)
+        fig.tight_layout()
+
     out = output_dir / "per_fs_block_distribution.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
 
@@ -100,114 +149,123 @@ def plot_input_blocks_per_fs(results, metadata, output_dir: Path):
 
     num_datanode_hosts = metadata.get("datanode_hosts", 4)
 
+    total_bars = sum(len(r["input_block_counts_per_fs"]) for r in valid_results)
+
     # =========================================================================
-    # PLOT A: Grouped bar chart with per-node coloring
+    # PLOT A: Per-FS counts — heatmap for large k, grouped bars otherwise
     # =========================================================================
-    fig, ax = plt.subplots(figsize=(14, 8))
+    if total_bars > HEATMAP_THRESHOLD:
+        max_fs = max(len(r["input_block_counts_per_fs"]) for r in valid_results)
+        k_labels = [f"k={r['k']}" for r in valid_results]
+        matrix = np.zeros((len(valid_results), max_fs))
+        for i, r in enumerate(valid_results):
+            for j, c in enumerate(r["input_block_counts_per_fs"]):
+                matrix[i, j] = c
 
-    x_positions = []
-    x_labels = []
-    all_counts = []
-    node_colors = []
-    k_boundaries = []
-    current_x = 0
+        fig, ax = plt.subplots(figsize=(min(max_fs * 0.3 + 4, 22), max(5, len(valid_results) * 0.6 + 2)))
+        im = ax.imshow(matrix, aspect="auto", cmap="YlOrRd")
+        ax.set_yticks(range(len(k_labels)))
+        ax.set_yticklabels(k_labels, fontsize=10)
+        ax.set_xlabel("Filesystem index (across all DataNodes)", fontsize=12)
+        ax.set_ylabel("k (storage dirs per DataNode)", fontsize=12)
+        ax.set_title(
+            "Input File Block Distribution per Filesystem\n"
+            f"({_subtitle(metadata)})",
+            fontsize=13,
+        )
+        plt.colorbar(im, ax=ax, label="Input blocks (with replicas)")
+        fig.tight_layout()
+    else:
+        color_palette = plt.colormaps["Set2"](np.linspace(0, 1, num_datanode_hosts))
+        fig, ax = plt.subplots(figsize=(14, 8))
+        x_positions, x_labels, all_counts, node_colors, k_boundaries = [], [], [], [], []
+        current_x = 0
 
-    color_palette = cm.Set2(np.linspace(0, 1, num_datanode_hosts))
+        for r in valid_results:
+            k = r["k"]
+            counts = r["input_block_counts_per_fs"]
+            k_boundaries.append(current_x)
+            for i, cnt in enumerate(counts):
+                node_idx = i // k if k > 0 else 0
+                fs_in_node = i % k + 1 if k > 0 else i + 1
+                x_positions.append(current_x)
+                x_labels.append(f"N{node_idx+1}\nFS{fs_in_node}")
+                all_counts.append(cnt)
+                node_colors.append(color_palette[node_idx % num_datanode_hosts])
+                current_x += 1
+            current_x += 1.5
 
-    for r in valid_results:
-        k = r["k"]
-        counts = r["input_block_counts_per_fs"]
-        k_boundaries.append(current_x)
+        ax.bar(x_positions, all_counts, color=node_colors, edgecolor="black",
+               linewidth=0.5, alpha=0.85)
 
-        # Each count corresponds to a filesystem
-        # Filesystems are distributed across nodes: node1_fs1, node1_fs2, ..., node2_fs1, ...
-        for i, cnt in enumerate(counts):
-            node_idx = i // k if k > 0 else 0  # Which DataNode this FS belongs to
-            fs_in_node = i % k + 1 if k > 0 else i + 1  # Which FS within the node
-
-            x_positions.append(current_x)
-            x_labels.append(f"N{node_idx+1}\nFS{fs_in_node}")
-            all_counts.append(cnt)
-            node_colors.append(color_palette[node_idx % num_datanode_hosts])
-            current_x += 1
-
-        current_x += 1.5  # Gap between k values
-
-    bars = ax.bar(x_positions, all_counts, color=node_colors, edgecolor='black', linewidth=0.5, alpha=0.85)
-
-    # Add k value labels above each group
-    for i, r in enumerate(valid_results):
-        k = r["k"]
-        counts = r["input_block_counts_per_fs"]
-        if counts:
-            start_x = k_boundaries[i]
-            end_x = start_x + len(counts) - 1
-            mid_x = (start_x + end_x) / 2
-            max_in_group = max(counts) if counts else 0
-            ax.text(mid_x, max_in_group + max(all_counts) * 0.05, f"k={k}",
-                    ha='center', va='bottom', fontsize=12, fontweight='bold',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgray', alpha=0.7))
-
-            # Add statistics annotation
+        global_max = max(all_counts) if all_counts else 1
+        for i, r in enumerate(valid_results):
+            k = r["k"]
+            counts = r["input_block_counts_per_fs"]
+            if not counts:
+                continue
+            mid_x = (k_boundaries[i] + k_boundaries[i] + len(counts) - 1) / 2
+            ax.text(mid_x, max(counts) + global_max * 0.04, f"k={k}",
+                    ha="center", va="bottom", fontsize=11, fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="lightgray", alpha=0.7))
             mean_val = np.mean(counts)
-            std_val = np.std(counts)
-            cv = (std_val / mean_val * 100) if mean_val > 0 else 0
-            ax.text(mid_x, -max(all_counts) * 0.12,
-                    f"μ={mean_val:.0f}, σ={std_val:.1f}\nCV={cv:.1f}%",
-                    ha='center', va='top', fontsize=9, color='gray')
+            cv = np.std(counts) / mean_val * 100 if mean_val > 0 else 0
+            ax.text(mid_x, global_max * 1.14,
+                    f"CV={cv:.1f}%", ha="center", fontsize=8, color="gray")
 
-    # Create legend for nodes
-    legend_handles = [plt.Rectangle((0,0),1,1, color=color_palette[i], alpha=0.85)
-                      for i in range(min(num_datanode_hosts, len(color_palette)))]
-    legend_labels = [f"Node {i+1}" for i in range(num_datanode_hosts)]
-    ax.legend(legend_handles, legend_labels, loc='upper right', fontsize=10, title="DataNodes")
-
-    ax.set_ylabel("Input File Blocks (with replicas)", fontsize=13)
-    ax.set_xlabel("Filesystem (Node / FS index)", fontsize=13)
-    ax.set_title("Input File Block Distribution per Filesystem\n(Grouped by k, colored by DataNode)", fontsize=14)
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels(x_labels, fontsize=8, rotation=0)
-    ax.grid(True, axis='y', alpha=0.3)
-    fig.tight_layout()
+        legend_handles = [plt.Rectangle((0, 0), 1, 1, color=color_palette[i], alpha=0.85)
+                          for i in range(num_datanode_hosts)]
+        ax.legend(legend_handles, [f"Node {i+1}" for i in range(num_datanode_hosts)],
+                  loc="upper right", fontsize=10, title="DataNodes")
+        ax.set_ylabel("Input File Blocks (with replicas)", fontsize=13)
+        ax.set_xlabel("Filesystem (Node / FS index)", fontsize=13)
+        ax.set_title(
+            "Input File Block Distribution per Filesystem\n"
+            f"(Grouped by k, coloured by DataNode — {_subtitle(metadata)})",
+            fontsize=13,
+        )
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(x_labels, fontsize=8)
+        ax.set_ylim(top=global_max * 1.22)
+        ax.grid(True, axis="y", alpha=0.3)
+        fig.tight_layout()
 
     out = output_dir / "input_blocks_per_fs.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
 
     # =========================================================================
     # PLOT B: Box plot showing distribution per k value
     # =========================================================================
-    fig, ax = plt.subplots(figsize=(10, 7))
+    fig, ax = plt.subplots(figsize=(max(8, len(valid_results) * 0.9), 7))
 
-    box_data = []
-    box_labels = []
+    box_data, box_labels = [], []
     for r in valid_results:
-        k = r["k"]
         counts = r["input_block_counts_per_fs"]
         if counts:
             box_data.append(counts)
-            box_labels.append(f"k={k}\n({len(counts)} FSes)")
+            box_labels.append(f"k={r['k']}\n({len(counts)} FSes)")
 
     if box_data:
         bp = ax.boxplot(box_data, labels=box_labels, patch_artist=True)
-        colors = cm.viridis(np.linspace(0.2, 0.8, len(box_data)))
-        for patch, color in zip(bp['boxes'], colors):
+        colors = plt.colormaps["viridis"](np.linspace(0.2, 0.8, len(box_data)))
+        for patch, color in zip(bp["boxes"], colors):
             patch.set_facecolor(color)
             patch.set_alpha(0.7)
-
-        # Add mean markers
         means = [np.mean(d) for d in box_data]
-        ax.scatter(range(1, len(means)+1), means, marker='D', color='red', s=50, zorder=5, label='Mean')
-
+        ax.scatter(range(1, len(means) + 1), means, marker="D", color="red",
+                   s=50, zorder=5, label="Mean")
         ax.set_ylabel("Blocks per Filesystem", fontsize=13)
         ax.set_xlabel("Configuration", fontsize=13)
-        ax.set_title("Input Block Distribution Statistics per k Value\n(Box shows quartiles, diamond shows mean)", fontsize=13)
+        ax.set_title(
+            "Input Block Distribution per k\n(Box = quartiles, diamond = mean)",
+            fontsize=13,
+        )
         ax.legend(fontsize=10)
-        ax.grid(True, axis='y', alpha=0.3)
-
+        ax.grid(True, axis="y", alpha=0.3)
         out = output_dir / "input_blocks_boxplot.png"
-        fig.savefig(out, dpi=150)
+        fig.savefig(out, dpi=DPI)
         print(f"Saved: {out}")
     plt.close(fig)
 
@@ -249,7 +307,7 @@ def plot_input_blocks_per_fs(results, metadata, output_dir: Path):
         ax.grid(True, axis='y', alpha=0.3)
 
         out = output_dir / "input_blocks_balance.png"
-        fig.savefig(out, dpi=150)
+        fig.savefig(out, dpi=DPI)
         print(f"Saved: {out}")
     plt.close(fig)
 
@@ -257,93 +315,96 @@ def plot_input_blocks_per_fs(results, metadata, output_dir: Path):
 def plot_fs_capacity_per_node(results, metadata, output_dir: Path):
     """
     Histogram showing used filesystem capacity per loopback FS.
-    This is Aviad's requested visualization:
     - X-axis: Filesystem 'number' (grouped by k value)
     - Y-axis: Used filesystem capacity (MB)
     - Different coloring per DataNode
+    Uses a heatmap when total bars would exceed HEATMAP_THRESHOLD.
     """
-    # Filter results that have capacity data
     valid_results = [r for r in results if r.get("fs_used_mb_per_fs")]
     if not valid_results:
         print("No filesystem capacity data available, skipping capacity plot.")
         return
 
     num_datanode_hosts = metadata.get("datanode_hosts", 4)
+    total_bars = sum(len(r["fs_used_mb_per_fs"]) for r in valid_results)
 
     # =========================================================================
-    # PLOT A: Grouped bar chart with per-node coloring
+    # PLOT A: Heatmap for large k, grouped bars otherwise
     # =========================================================================
-    fig, ax = plt.subplots(figsize=(14, 8))
+    if total_bars > HEATMAP_THRESHOLD:
+        max_fs = max(len(r["fs_used_mb_per_fs"]) for r in valid_results)
+        k_labels = [f"k={r['k']}" for r in valid_results]
+        matrix = np.zeros((len(valid_results), max_fs))
+        for i, r in enumerate(valid_results):
+            for j, c in enumerate(r["fs_used_mb_per_fs"]):
+                matrix[i, j] = c
 
-    x_positions = []
-    x_labels = []
-    all_capacities = []
-    node_colors = []
-    k_boundaries = []
-    current_x = 0
+        fig, ax = plt.subplots(figsize=(min(max_fs * 0.3 + 4, 22), max(5, len(valid_results) * 0.6 + 2)))
+        im = ax.imshow(matrix, aspect="auto", cmap="YlOrRd")
+        ax.set_yticks(range(len(k_labels)))
+        ax.set_yticklabels(k_labels, fontsize=10)
+        ax.set_xlabel("Filesystem index (across all DataNodes)", fontsize=12)
+        ax.set_ylabel("k (storage dirs per DataNode)", fontsize=12)
+        ax.set_title(
+            "Filesystem Used Capacity per Loopback FS\n"
+            f"({_subtitle(metadata)})",
+            fontsize=13,
+        )
+        plt.colorbar(im, ax=ax, label="Used capacity (MB)")
+        fig.tight_layout()
+    else:
+        color_palette = plt.colormaps["Set2"](np.linspace(0, 1, num_datanode_hosts))
+        fig, ax = plt.subplots(figsize=(14, 8))
+        x_positions, x_labels, all_capacities, node_colors, k_boundaries = [], [], [], [], []
+        current_x = 0
 
-    # Use same color palette as plot_input_blocks_per_fs for consistency
-    color_palette = cm.Set2(np.linspace(0, 1, num_datanode_hosts))
+        for r in valid_results:
+            k = r["k"]
+            capacities = r["fs_used_mb_per_fs"]
+            k_boundaries.append(current_x)
+            for i, cap in enumerate(capacities):
+                node_idx = i // k if k > 0 else 0
+                fs_in_node = i % k + 1 if k > 0 else i + 1
+                x_positions.append(current_x)
+                x_labels.append(f"N{node_idx+1}\nFS{fs_in_node}")
+                all_capacities.append(cap)
+                node_colors.append(color_palette[node_idx % num_datanode_hosts])
+                current_x += 1
+            current_x += 1.5
 
-    for r in valid_results:
-        k = r["k"]
-        capacities = r["fs_used_mb_per_fs"]
-        k_boundaries.append(current_x)
+        ax.bar(x_positions, all_capacities, color=node_colors,
+               edgecolor="black", linewidth=0.5, alpha=0.85)
 
-        # Each capacity value corresponds to a filesystem
-        # Filesystems are distributed across nodes: node1_fs1, node1_fs2, ..., node2_fs1, ...
-        for i, cap in enumerate(capacities):
-            node_idx = i // k if k > 0 else 0  # Which DataNode this FS belongs to
-            fs_in_node = i % k + 1 if k > 0 else i + 1  # Which FS within the node
-
-            x_positions.append(current_x)
-            x_labels.append(f"N{node_idx+1}\nFS{fs_in_node}")
-            all_capacities.append(cap)
-            node_colors.append(color_palette[node_idx % num_datanode_hosts])
-            current_x += 1
-
-        current_x += 1.5  # Gap between k values
-
-    bars = ax.bar(x_positions, all_capacities, color=node_colors,
-                  edgecolor='black', linewidth=0.5, alpha=0.85)
-
-    # Add k value labels above each group
-    for i, r in enumerate(valid_results):
-        k = r["k"]
-        capacities = r["fs_used_mb_per_fs"]
-        if capacities:
-            start_x = k_boundaries[i]
-            end_x = start_x + len(capacities) - 1
-            mid_x = (start_x + end_x) / 2
-            max_in_group = max(capacities) if capacities else 0
-            ax.text(mid_x, max_in_group + max(all_capacities) * 0.05, f"k={k}",
-                    ha='center', va='bottom', fontsize=12, fontweight='bold',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='lightgray', alpha=0.7))
-
-            # Add statistics annotation
+        global_max = max(all_capacities) if all_capacities else 1
+        for i, r in enumerate(valid_results):
+            k = r["k"]
+            capacities = r["fs_used_mb_per_fs"]
+            if not capacities:
+                continue
+            mid_x = (k_boundaries[i] + k_boundaries[i] + len(capacities) - 1) / 2
+            ax.text(mid_x, max(capacities) + global_max * 0.04, f"k={k}",
+                    ha="center", va="bottom", fontsize=12, fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.7))
             mean_val = np.mean(capacities)
-            std_val = np.std(capacities)
-            cv = (std_val / mean_val * 100) if mean_val > 0 else 0
-            ax.text(mid_x, -max(all_capacities) * 0.12,
-                    f"mean={mean_val:.0f}MB, std={std_val:.1f}\nCV={cv:.1f}%",
-                    ha='center', va='top', fontsize=9, color='gray')
+            cv = np.std(capacities) / mean_val * 100 if mean_val > 0 else 0
+            ax.text(mid_x, global_max * 1.14,
+                    f"CV={cv:.1f}%", ha="center", fontsize=8, color="gray")
 
-    # Create legend for nodes
-    legend_handles = [plt.Rectangle((0,0),1,1, color=color_palette[i], alpha=0.85)
-                      for i in range(min(num_datanode_hosts, len(color_palette)))]
-    legend_labels = [f"Node {i+1}" for i in range(num_datanode_hosts)]
-    ax.legend(legend_handles, legend_labels, loc='upper right', fontsize=10, title="DataNodes")
-
-    ax.set_ylabel("Used Filesystem Capacity (MB)", fontsize=13)
-    ax.set_xlabel("Filesystem (Node / FS index)", fontsize=13)
-    ax.set_title("Filesystem Used Capacity per Loopback FS\n(Grouped by k, colored by DataNode)", fontsize=14)
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels(x_labels, fontsize=8, rotation=0)
-    ax.grid(True, axis='y', alpha=0.3)
-    fig.tight_layout()
+        legend_handles = [plt.Rectangle((0, 0), 1, 1, color=color_palette[i], alpha=0.85)
+                          for i in range(min(num_datanode_hosts, len(color_palette)))]
+        ax.legend(legend_handles, [f"Node {i+1}" for i in range(num_datanode_hosts)],
+                  loc="upper right", fontsize=10, title="DataNodes")
+        ax.set_ylabel("Used Filesystem Capacity (MB)", fontsize=13)
+        ax.set_xlabel("Filesystem (Node / FS index)", fontsize=13)
+        ax.set_title("Filesystem Used Capacity per Loopback FS\n(Grouped by k, colored by DataNode)", fontsize=14)
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(x_labels, fontsize=8)
+        ax.set_ylim(top=global_max * 1.22)
+        ax.grid(True, axis="y", alpha=0.3)
+        fig.tight_layout()
 
     out = output_dir / "fs_capacity_per_node.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
 
@@ -385,7 +446,7 @@ def plot_fs_capacity_per_node(results, metadata, output_dir: Path):
         ax.grid(True, axis='y', alpha=0.3)
 
         out = output_dir / "fs_capacity_balance.png"
-        fig.savefig(out, dpi=150)
+        fig.savefig(out, dpi=DPI)
         print(f"Saved: {out}")
     plt.close(fig)
 
@@ -440,14 +501,14 @@ def read_metadata(meta_path: Path):
 
 def _subtitle(metadata):
     """Build a standard subtitle string from metadata."""
-    input_gb = metadata.get("input_size_gb", 20)
-    block_human = metadata.get("block_size_human", "128MB")
+    input_gb = metadata.get("input_size_gb", 22)
+    block_human = metadata.get("block_size_human", "16MB")
     num_dns = metadata.get("datanode_hosts", "?")
     replication = metadata.get("replication", 3)
     reps = metadata.get("repetitions", "?")
     return (
-        f"{input_gb}GB input, {block_human} blocks, replication={replication}, "
-        f"{num_dns} DataNodes, {reps} runs averaged"
+        f"{input_gb}GB input, {block_human} blocks, rep={replication}, "
+        f"{num_dns} DataNodes, {reps} runs avg"
     )
 
 
@@ -462,7 +523,7 @@ def plot_runtime_vs_k(results, metadata, output_dir: Path):
     stddevs = [r["stddev"] for r in results]
     total_dirs = [r["total_dirs"] for r in results]
 
-    colors = cm.viridis(np.linspace(0.2, 0.8, len(k_vals)))
+    colors = plt.colormaps["viridis"](np.linspace(0.2, 0.8, len(k_vals)))
 
     bars = ax.bar(
         range(len(k_vals)), runtimes,
@@ -492,7 +553,7 @@ def plot_runtime_vs_k(results, metadata, output_dir: Path):
     fig.tight_layout()
 
     out = output_dir / "runtime_vs_k.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
 
@@ -534,7 +595,7 @@ def plot_runtime_vs_total_dirs(results, metadata, output_dir: Path):
     fig.tight_layout()
 
     out = output_dir / "runtime_vs_total_dirs.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
 
@@ -543,13 +604,18 @@ def plot_runtime_vs_total_dirs(results, metadata, output_dir: Path):
 # PLOT 3: Speedup vs k=2 baseline
 # ============================================================================
 def plot_speedup(results, metadata, output_dir: Path):
-    if not results or results[0]["k"] != 2:
-        print("WARNING: k=2 not found as first result, skipping speedup plot.")
+    if not results or len(results) < 2:
+        print("WARNING: Need at least 2 results for speedup plot, skipping.")
+        return
+
+    baseline_k = results[0]["k"]
+    baseline = results[0]["avg_runtime"]
+    if baseline <= 0:
+        print("WARNING: Baseline runtime is zero, skipping speedup plot.")
         return
 
     fig, ax = plt.subplots(figsize=(10, 7))
 
-    baseline = results[0]["avg_runtime"]
     k_vals = [r["k"] for r in results]
     speedups = [baseline / r["avg_runtime"] if r["avg_runtime"] > 0 else 0 for r in results]
 
@@ -571,16 +637,16 @@ def plot_speedup(results, metadata, output_dir: Path):
     ax.set_xticks(range(len(k_vals)))
     ax.set_xticklabels([f"k={k}" for k in k_vals], fontsize=12)
     ax.set_xlabel("Storage Directories per DataNode (k)", fontsize=13)
-    ax.set_ylabel("Speedup vs k=2", fontsize=13)
+    ax.set_ylabel(f"Speedup vs k={baseline_k} baseline", fontsize=13)
     ax.set_title(
-        "Speedup from Storage Virtualization\n(>1.0 = faster than baseline k=2)",
+        f"Speedup from Storage Virtualization\n(>1.0 = faster than baseline k={baseline_k})",
         fontsize=13,
     )
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
 
     out = output_dir / "speedup_vs_k.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
 
@@ -592,14 +658,15 @@ def plot_individual_runs(results, metadata, output_dir: Path):
     fig, ax = plt.subplots(figsize=(12, 7))
 
     k_vals = [r["k"] for r in results]
+    colors = _k_colors(len(results))
 
     for i, r in enumerate(results):
         individual = [float(x) for x in r["individual"].split(";") if x]
         x_jitter = np.random.normal(i, 0.05, len(individual))
-        ax.scatter(x_jitter, individual, alpha=0.6, s=60, zorder=5)
+        ax.scatter(x_jitter, individual, alpha=0.7, s=60, zorder=5, color=colors[i])
         ax.hlines(
             r["avg_runtime"], i - 0.25, i + 0.25,
-            color="red", linewidth=2, zorder=10,
+            color="black", linewidth=2, zorder=10,
             label="Mean" if i == 0 else None,
         )
 
@@ -613,7 +680,7 @@ def plot_individual_runs(results, metadata, output_dir: Path):
     fig.tight_layout()
 
     out = output_dir / "individual_runs.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
 
@@ -658,7 +725,7 @@ def plot_runtime_vs_k_logscale(results, metadata, output_dir: Path):
     fig.tight_layout()
 
     out = output_dir / "runtime_vs_k_logscale.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
 
@@ -733,7 +800,7 @@ def plot_nn_memory_vs_k(results, metadata, output_dir: Path):
     fig.tight_layout()
 
     out = output_dir / "nn_memory_vs_k.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
 
@@ -813,7 +880,7 @@ def plot_runtime_and_memory(results, metadata, output_dir: Path):
     fig.tight_layout()
 
     out = output_dir / "runtime_and_memory_vs_k.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
 
@@ -827,21 +894,21 @@ def plot_nn_memory_timeseries(timeseries, metadata, output_dir: Path):
         print("No NameNode memory time series data found, skipping.")
         return
 
-    fig, ax = plt.subplots(figsize=(12, 7))
-
-    colors = cm.tab10(np.linspace(0, 0.8, len(timeseries)))
-    markers = ["o", "s", "^", "D", "v"]
-
+    sorted_items = sorted(timeseries.items())
+    colors = _k_colors(len(sorted_items))
     datanode_hosts = metadata.get("datanode_hosts", metadata.get("physical_nodes", 5))
 
-    for idx, (k, rows) in enumerate(sorted(timeseries.items())):
+    many = len(sorted_items) > 8
+    fig, ax = plt.subplots(figsize=(14 if many else 12, 7))
+
+    for idx, (k, rows) in enumerate(sorted_items):
         heap_values = [r["heap_used_mb"] for r in rows]
         time_offsets = list(range(0, len(heap_values) * 5, 5))
 
         ax.plot(
             time_offsets[:len(heap_values)],
             heap_values,
-            marker=markers[idx % len(markers)],
+            marker=MARKERS[idx % len(MARKERS)],
             color=colors[idx],
             linewidth=1.5,
             markersize=4,
@@ -856,53 +923,73 @@ def plot_nn_memory_timeseries(timeseries, metadata, output_dir: Path):
         f"({_subtitle(metadata)})",
         fontsize=12,
     )
-    ax.legend(fontsize=10, loc="best")
+    if many:
+        ax.legend(fontsize=9, bbox_to_anchor=(1.01, 1), loc="upper left",
+                  borderaxespad=0, title="k value")
+    else:
+        ax.legend(fontsize=10, loc="best")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
 
     out = output_dir / "nn_memory_timeseries.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
 
 
 # ============================================================================
-# PLOT 9: Block Distribution Across Loopback Filesystems
+# PLOT 9: Mean blocks per FS (block dilution as k grows)
 # ============================================================================
 def plot_block_distribution(results, metadata, output_dir: Path):
-    """Bar chart showing block distribution across loopback filesystems."""
-    fig, ax = plt.subplots(figsize=(12, 7))
+    """Line+bar chart showing mean blocks per filesystem as k grows.
 
-    k_vals = [r["k"] for r in results]
-    block_counts = [r["nn_block_count"] for r in results]
+    The total block count is constant (same input every run), so plotting the
+    raw total would be a flat line.  Instead we show nn_block_count / (k * num_dns)
+    — the expected blocks each FS holds if the NameNode distributes evenly.
+    This illustrates block *dilution*: each FS gets fewer blocks as k increases,
+    which means smaller per-FS metadata working sets for the NameNode.
+    """
+    valid = [r for r in results if r["nn_block_count"] > 0]
+    if not valid:
+        return
 
-    bars = ax.bar(
-        range(len(k_vals)), block_counts,
-        color="skyblue", alpha=0.85,
-        edgecolor="black", linewidth=0.5,
-    )
+    num_dns = metadata.get("datanode_hosts", 4)
+    k_vals = [r["k"] for r in valid]
+    total_blocks = [r["nn_block_count"] for r in valid]
+    # total storage dirs in cluster = k * num_dns
+    total_fses = [k * num_dns for k in k_vals]
+    mean_per_fs = [t / f for t, f in zip(total_blocks, total_fses)]
 
-    for bar, blocks, k in zip(bars, block_counts, k_vals):
+    colors = _k_colors(len(valid))
+    fig, ax = plt.subplots(figsize=(max(10, len(valid) * 1.1), 7))
+
+    bars = ax.bar(range(len(k_vals)), mean_per_fs, color=colors,
+                  alpha=0.85, edgecolor="black", linewidth=0.5)
+
+    max_val = max(mean_per_fs) if mean_per_fs else 1
+    for bar, mpf, total in zip(bars, mean_per_fs, total_blocks):
         ax.text(
             bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + max(block_counts) * 0.03,
-            f"{blocks} blocks\nk={k}",
-            ha="center", va="bottom", fontsize=10, fontweight="bold",
+            bar.get_height() + max_val * 0.03,
+            f"{mpf:.0f}\n({total} total)",
+            ha="center", va="bottom", fontsize=9, fontweight="bold",
         )
 
     ax.set_xticks(range(len(k_vals)))
-    ax.set_xticklabels([f"k={k}" for k in k_vals], fontsize=12)
+    ax.set_xticklabels([f"k={k}\n({k * num_dns} FSes)" for k in k_vals], fontsize=11)
     ax.set_xlabel("Storage Directories per DataNode (k)", fontsize=13)
-    ax.set_ylabel("Total Blocks", fontsize=13)
+    ax.set_ylabel("Mean Blocks per Filesystem", fontsize=13)
     ax.set_title(
-        f"Block Distribution Across Loopback Filesystems\n({_subtitle(metadata)})",
+        f"Block Dilution: Mean Blocks per FS vs k\n"
+        f"(total block count is constant; each FS holds fewer as k grows)\n"
+        f"({_subtitle(metadata)})",
         fontsize=12,
     )
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
 
     out = output_dir / "block_distribution.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
 
@@ -916,7 +1003,7 @@ def read_iostat_data(iostat_dir: Path):
 
     Returns dict: {k: [row_dicts]} where each row has keys:
         timestamp, node, device, r_per_s, w_per_s, rkB_per_s, wkB_per_s,
-        await, r_await, w_await, util
+        r_await, w_await, rareq_sz, wareq_sz, aqu_sz, util
     """
     data = {}
     for csv_file in sorted(iostat_dir.glob("iostat_summary_k*.csv")):
@@ -939,9 +1026,11 @@ def read_iostat_data(iostat_dir: Path):
                         "w_per_s": float(row.get("w_per_s", 0) or 0),
                         "rkB_per_s": float(row.get("rkB_per_s", 0) or 0),
                         "wkB_per_s": float(row.get("wkB_per_s", 0) or 0),
-                        "await": float(row.get("await", 0) or 0),
                         "r_await": float(row.get("r_await", 0) or 0),
                         "w_await": float(row.get("w_await", 0) or 0),
+                        "rareq_sz": float(row.get("rareq_sz", 0) or 0),
+                        "wareq_sz": float(row.get("wareq_sz", 0) or 0),
+                        "aqu_sz": float(row.get("aqu_sz", 0) or 0),
                         "util": float(row.get("util", 0) or 0),
                     })
                 except (ValueError, KeyError):
@@ -951,55 +1040,89 @@ def read_iostat_data(iostat_dir: Path):
     return data
 
 
-def plot_iostat_await_vs_k(iostat_data, metadata, output_dir: Path):
-    """Bar chart: average disk await time (ms) for each k value."""
+def _weighted_stats(values, weights):
+    """IOPS-weighted mean and stddev. Returns (mean, std). Zero total weight -> (0, 0).
+
+    iostat reports await=0 when no ops occurred in the interval; including those
+    zeros in a plain mean biases latency downward. Weighting by IOPS (per-interval
+    ops per second) treats each operation equally and excludes idle intervals.
+    """
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    total_w = weights.sum()
+    if total_w <= 0:
+        return 0.0, 0.0
+    mean = float((values * weights).sum() / total_w)
+    var = float((weights * (values - mean) ** 2).sum() / total_w)
+    return mean, float(np.sqrt(max(var, 0.0)))
+
+
+def plot_iostat_latency_vs_k(iostat_data, metadata, output_dir: Path):
+    """Grouped bar chart: IOPS-weighted read and write latency (ms) for each k."""
     fig, ax = plt.subplots(figsize=(11, 7))
 
     k_vals = sorted(iostat_data.keys())
-    avg_awaits = []
-    std_awaits = []
+    avg_r_awaits, std_r_awaits = [], []
+    avg_w_awaits, std_w_awaits = [], []
 
     for k in k_vals:
-        awaits = [r["await"] for r in iostat_data[k]]
-        avg_awaits.append(np.mean(awaits) if awaits else 0)
-        std_awaits.append(np.std(awaits) if awaits else 0)
+        rows = iostat_data[k]
+        r_mean, r_std = _weighted_stats(
+            [r["r_await"] for r in rows], [r["r_per_s"] for r in rows]
+        )
+        w_mean, w_std = _weighted_stats(
+            [r["w_await"] for r in rows], [r["w_per_s"] for r in rows]
+        )
+        avg_r_awaits.append(r_mean)
+        std_r_awaits.append(r_std)
+        avg_w_awaits.append(w_mean)
+        std_w_awaits.append(w_std)
 
-    colors = cm.viridis(np.linspace(0.2, 0.8, len(k_vals)))
-    bars = ax.bar(
-        range(len(k_vals)), avg_awaits,
-        yerr=std_awaits,
-        color=colors, alpha=0.85,
-        error_kw={"capsize": 6},
-        edgecolor="black", linewidth=0.5,
-    )
+    x = np.arange(len(k_vals))
+    width = 0.35
+    bars_r = ax.bar(x - width / 2, avg_r_awaits, width, yerr=std_r_awaits,
+                    label="r_await (read)", color="#4C9BE8", alpha=0.85,
+                    error_kw={"capsize": 5}, edgecolor="black", linewidth=0.5)
+    bars_w = ax.bar(x + width / 2, avg_w_awaits, width, yerr=std_w_awaits,
+                    label="w_await (write)", color="#E8724C", alpha=0.85,
+                    error_kw={"capsize": 5}, edgecolor="black", linewidth=0.5)
 
-    for bar, avg, std in zip(bars, avg_awaits, std_awaits):
+    all_vals = avg_r_awaits + avg_w_awaits
+    max_val = max(all_vals) if all_vals else 1
+    for bar, avg, std in zip(list(bars_r) + list(bars_w),
+                              avg_r_awaits + avg_w_awaits,
+                              std_r_awaits + std_w_awaits):
         ax.text(
             bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + std + max(avg_awaits) * 0.03,
-            f"{avg:.2f}ms",
-            ha="center", va="bottom", fontsize=10, fontweight="bold",
+            bar.get_height() + std + max_val * 0.02,
+            f"{avg:.1f}",
+            ha="center", va="bottom", fontsize=9,
         )
 
-    ax.set_xticks(range(len(k_vals)))
+    ax.set_xticks(x)
     ax.set_xticklabels([f"k={k}" for k in k_vals], fontsize=12)
     ax.set_xlabel("Storage Directories per DataNode (k)", fontsize=13)
-    ax.set_ylabel("Average Disk Await Time (ms)", fontsize=13)
+    ax.set_ylabel("Average Disk Latency (ms)", fontsize=13)
     ax.set_title(
-        f"Disk I/O Wait Time vs Storage Directory Count\n({_subtitle(metadata)})",
+        f"Disk Read/Write Latency vs Storage Directory Count\n({_subtitle(metadata)})",
         fontsize=12,
     )
+    ax.legend(fontsize=11)
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
 
-    out = output_dir / "iostat_await_vs_k.png"
-    fig.savefig(out, dpi=150)
+    out = output_dir / "iostat_latency_vs_k.png"
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
 
 
 def plot_iostat_util_vs_k(iostat_data, metadata, output_dir: Path):
-    """Bar chart: average disk utilization (%) for each k value."""
+    """Bar chart: average disk utilization (%) across active devices, per k.
+
+    Excludes devices with no observed traffic (r/s + w/s == 0 throughout) so the
+    mean reflects real busy-ness, not averaged against idle SSDs.
+    """
     fig, ax = plt.subplots(figsize=(11, 7))
 
     k_vals = sorted(iostat_data.keys())
@@ -1007,11 +1130,12 @@ def plot_iostat_util_vs_k(iostat_data, metadata, output_dir: Path):
     std_utils = []
 
     for k in k_vals:
-        utils = [r["util"] for r in iostat_data[k]]
+        # Keep only rows from devices that did I/O in this interval.
+        utils = [r["util"] for r in iostat_data[k] if (r["r_per_s"] + r["w_per_s"]) > 0]
         avg_utils.append(np.mean(utils) if utils else 0)
         std_utils.append(np.std(utils) if utils else 0)
 
-    colors = cm.plasma(np.linspace(0.2, 0.8, len(k_vals)))
+    colors = plt.colormaps["plasma"](np.linspace(0.2, 0.8, len(k_vals)))
     bars = ax.bar(
         range(len(k_vals)), avg_utils,
         yerr=std_utils,
@@ -1040,69 +1164,230 @@ def plot_iostat_util_vs_k(iostat_data, metadata, output_dir: Path):
     fig.tight_layout()
 
     out = output_dir / "iostat_util_vs_k.png"
-    fig.savefig(out, dpi=150)
+    fig.savefig(out, dpi=DPI)
     print(f"Saved: {out}")
     plt.close(fig)
+
+
+def _snap_ts(ts_str):
+    """Convert an iostat timestamp string to a 5-second-snapped epoch integer.
+
+    Nodes run independent iostat processes; their clocks may differ by 1-3 s.
+    Snapping to the nearest 5 s grid (the iostat interval) ensures samples from
+    all nodes land in the same bucket even when clocks are slightly out of sync.
+    Falls back to the raw string if parsing fails (keeps old behaviour).
+    """
+    try:
+        dt = datetime.strptime(ts_str.strip(), "%m/%d/%Y %I:%M:%S %p")
+        epoch = int(dt.timestamp())
+        return (epoch // 5) * 5
+    except (ValueError, AttributeError):
+        return ts_str
+
+
+def _ts_aggregate(rows, metric_key, mode):
+    """Aggregate a per-device iostat metric over time.
+
+    mode:
+      "sum"   - cluster total at each timestamp (throughput/IOPS: rkB/s, wkB/s, r/s, w/s)
+      "mean"  - average across devices that reported in that interval (%util, queue, req size)
+      "wmean_r" - IOPS-weighted by r/s (read-side latency: r_await, rareq_sz)
+      "wmean_w" - IOPS-weighted by w/s (write-side latency: w_await, wareq_sz)
+
+    Returns (time_offsets_seconds, values) in timestamp order.
+    Timestamps are snapped to the nearest 5-second epoch so that samples from
+    different nodes (whose clocks may drift by 1-3 s) are bucketed together.
+    """
+    ts_order = []
+    buckets = {}
+    for r in rows:
+        ts = _snap_ts(r["timestamp"])
+        if ts not in buckets:
+            buckets[ts] = []
+            ts_order.append(ts)
+        buckets[ts].append(r)
+
+    # Sort chronologically. Keys are int epochs after _snap_ts; sorting makes
+    # the order independent of which node's rows appear first in the input list.
+    try:
+        ts_order.sort()
+    except TypeError:
+        pass  # mixed int/str (fallback path) — keep insertion order
+
+    values = []
+    for ts in ts_order:
+        group = buckets[ts]
+        if mode == "sum":
+            values.append(sum(r[metric_key] for r in group))
+        elif mode == "mean":
+            nonzero = [r[metric_key] for r in group if (r["r_per_s"] + r["w_per_s"]) > 0]
+            values.append(np.mean(nonzero) if nonzero else 0.0)
+        elif mode in ("wmean_r", "wmean_w"):
+            w_key = "r_per_s" if mode == "wmean_r" else "w_per_s"
+            tot = sum(r[w_key] for r in group)
+            if tot > 0:
+                values.append(sum(r[metric_key] * r[w_key] for r in group) / tot)
+            else:
+                values.append(0.0)
+        else:
+            raise ValueError(mode)
+
+    time_offsets = list(range(0, len(ts_order) * 5, 5))
+    return time_offsets, values
 
 
 def plot_iostat_timeseries(iostat_data, metadata, output_dir: Path):
-    """2x2 subplot: await, %util, wkB/s, r/s over time for each k value."""
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    """One PNG per metric: cluster-aggregated iostat value over time for each k."""
     metrics = [
-        ("await", "Avg Await (ms)", axes[0, 0]),
-        ("util", "Avg %util", axes[0, 1]),
-        ("wkB_per_s", "Avg Write KB/s", axes[1, 0]),
-        ("r_per_s", "Avg Reads/s", axes[1, 1]),
+        ("w_await",   "Write Latency w_await (ms)",    "wmean_w", "iostat_ts_w_await.png"),
+        ("r_await",   "Read Latency r_await (ms)",     "wmean_r", "iostat_ts_r_await.png"),
+        ("util",      "Disk Utilization %util",        "mean",    "iostat_ts_util.png"),
+        ("wkB_per_s", "Cluster Write Throughput (KB/s)", "sum",   "iostat_ts_wkB_per_s.png"),
+        ("rkB_per_s", "Cluster Read Throughput (KB/s)",  "sum",   "iostat_ts_rkB_per_s.png"),
+        ("w_per_s",   "Cluster Write IOPS (w/s)",      "sum",     "iostat_ts_w_per_s.png"),
+        ("r_per_s",   "Cluster Read IOPS (r/s)",       "sum",     "iostat_ts_r_per_s.png"),
+        ("aqu_sz",    "I/O Queue Depth (aqu-sz)",      "mean",    "iostat_ts_aqu_sz.png"),
     ]
 
     k_vals = sorted(iostat_data.keys())
-    colors = cm.tab10(np.linspace(0, 0.8, len(k_vals)))
-    markers = ["o", "s", "^", "D", "v", "P", "X", "h", "*", "d"]
-
+    colors = _k_colors(len(k_vals))
     datanode_hosts = metadata.get("datanode_hosts", metadata.get("physical_nodes", 5))
+    many = len(k_vals) > 8
 
-    for metric_key, ylabel, ax in metrics:
+    for metric_key, ylabel, mode, filename in metrics:
+        fig, ax = plt.subplots(figsize=(14 if many else 11, 7))
         for idx, k in enumerate(k_vals):
-            rows = iostat_data[k]
-            # Group by timestamp order and average across all nodes/devices
-            ts_values = {}
-            ts_order = []
-            for r in rows:
-                ts = r["timestamp"]
-                if ts not in ts_values:
-                    ts_values[ts] = []
-                    ts_order.append(ts)
-                ts_values[ts].append(r[metric_key])
-
-            time_offsets = list(range(0, len(ts_order) * 5, 5))
-            avg_values = [np.mean(ts_values[ts]) for ts in ts_order]
-
+            time_offsets, vals = _ts_aggregate(iostat_data[k], metric_key, mode)
             ax.plot(
-                time_offsets[:len(avg_values)],
-                avg_values,
-                marker=markers[idx % len(markers)],
+                time_offsets, vals,
+                marker=MARKERS[idx % len(MARKERS)],
                 color=colors[idx],
-                linewidth=1.5,
-                markersize=4,
-                alpha=0.8,
+                linewidth=1.5, markersize=4, alpha=0.85,
                 label=f"k={k} ({k * datanode_hosts} dirs)",
             )
 
-        ax.set_xlabel("Time (seconds)", fontsize=11)
-        ax.set_ylabel(ylabel, fontsize=11)
-        ax.legend(fontsize=9, loc="best")
+        ax.set_xlabel("Cumulative WordCount Active Time (seconds, runs concatenated)", fontsize=11)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(
+            f"{ylabel} Over Time (During WordCount)\n({_subtitle(metadata)})",
+            fontsize=12,
+        )
+        if many:
+            ax.legend(fontsize=9, bbox_to_anchor=(1.01, 1), loc="upper left",
+                      borderaxespad=0, title="k value")
+        else:
+            ax.legend(fontsize=10, loc="best")
         ax.grid(True, alpha=0.3)
+        fig.tight_layout()
 
-    fig.suptitle(
-        f"Disk I/O Metrics Over Time (During WordCount)\n({_subtitle(metadata)})",
-        fontsize=13,
-    )
-    fig.tight_layout()
+        out = output_dir / filename
+        fig.savefig(out, dpi=DPI)
+        print(f"Saved: {out}")
+        plt.close(fig)
 
-    out = output_dir / "iostat_timeseries.png"
-    fig.savefig(out, dpi=150)
-    print(f"Saved: {out}")
-    plt.close(fig)
+
+def plot_iostat_per_node_comparison(iostat_data, metadata, output_dir: Path):
+    """One PNG per metric: per-node/device bars grouped by k value.
+
+    Aggregation per (node, device, k):
+      - sum        : mean of per-interval sums (avg cluster throughput contribution)
+      - mean       : mean over intervals where the device was active
+      - wmean_r/_w : IOPS-weighted mean (latency, per-op request size)
+    """
+    metrics = [
+        ("w_await",   "Write Latency w_await (ms)",      "lower is better",   "wmean_w", "iostat_node_w_await.png"),
+        ("r_await",   "Read Latency r_await (ms)",       "lower is better",   "wmean_r", "iostat_node_r_await.png"),
+        ("util",      "Disk Utilization %util",          "lower is better",   "mean",    "iostat_node_util.png"),
+        ("rkB_per_s", "Read Throughput rkB/s",           "higher is better",  "mean",    "iostat_node_rkB_per_s.png"),
+        ("wkB_per_s", "Write Throughput wkB/s",          "higher is better",  "mean",    "iostat_node_wkB_per_s.png"),
+        ("rareq_sz",  "Read Request Size rareq-sz (KB)", "higher is better",  "wmean_r", "iostat_node_rareq_sz.png"),
+        ("wareq_sz",  "Write Request Size wareq-sz (KB)","higher is better",  "wmean_w", "iostat_node_wareq_sz.png"),
+        ("aqu_sz",    "I/O Queue Depth aqu-sz",          "lower is better",   "mean",    "iostat_node_aqu_sz.png"),
+        ("r_per_s",   "Read IOPS r/s",                   "context-dependent", "mean",    "iostat_node_r_per_s.png"),
+        ("w_per_s",   "Write IOPS w/s",                  "context-dependent", "mean",    "iostat_node_w_per_s.png"),
+    ]
+
+    k_vals = sorted(iostat_data.keys())
+
+    from collections import defaultdict
+
+    # For each k, bucket rows by "node/device" then by metric list
+    node_rows = {}  # {k: {nd_key: [row, ...]}}
+    for k in k_vals:
+        bucket = defaultdict(list)
+        for r in iostat_data[k]:
+            bucket[f"{r['node']}/{r['device']}"].append(r)
+        node_rows[k] = bucket
+
+    # Active devices: any k shows non-trivial utilization
+    all_nodes = set()
+    for k in k_vals:
+        for nd_key, rows in node_rows[k].items():
+            if rows and np.mean([r["util"] for r in rows]) > 0.1:
+                all_nodes.add(nd_key)
+    nodes = sorted(all_nodes)
+    if not nodes:
+        return
+
+    def _node_agg(rows, metric_key, mode):
+        if not rows:
+            return 0.0
+        if mode == "mean":
+            active = [r[metric_key] for r in rows if (r["r_per_s"] + r["w_per_s"]) > 0]
+            return float(np.mean(active)) if active else 0.0
+        w_key = "r_per_s" if mode == "wmean_r" else "w_per_s"
+        tot = sum(r[w_key] for r in rows)
+        if tot <= 0:
+            return 0.0
+        return float(sum(r[metric_key] * r[w_key] for r in rows) / tot)
+
+    colors = _k_colors(len(k_vals))
+    x = np.arange(len(nodes))
+    width = 0.8 / max(len(k_vals), 1)
+    short_labels = [n.replace("tapuz", "t") for n in nodes]
+    many = len(k_vals) > 8
+
+    for metric_key, ylabel, direction, mode, filename in metrics:
+        fig, ax = plt.subplots(figsize=(max(14 if many else 10, len(nodes) * 1.2), 7))
+        all_avgs = []
+        for ki, k in enumerate(k_vals):
+            avgs = [_node_agg(node_rows[k].get(nd, []), metric_key, mode) for nd in nodes]
+            all_avgs.extend(avgs)
+            bars = ax.bar(
+                x + ki * width - 0.4 + width / 2, avgs, width,
+                label=f"k={k}", color=colors[ki], alpha=0.85,
+                edgecolor="black", linewidth=0.5,
+            )
+            peak = max(all_avgs) if all_avgs else 1.0
+            for bar, avg in zip(bars, avgs):
+                if avg > 0:
+                    ax.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + peak * 0.02,
+                        f"{avg:.1f}",
+                        ha="center", va="bottom", fontsize=8,
+                    )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(short_labels, fontsize=10)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_xlabel("Node / Device", fontsize=12)
+        ax.set_title(
+            f"{ylabel} per Node ({direction})\n({_subtitle(metadata)})",
+            fontsize=12,
+        )
+        if many:
+            ax.legend(fontsize=9, bbox_to_anchor=(1.01, 1), loc="upper left",
+                      borderaxespad=0, title="k")
+        else:
+            ax.legend(fontsize=10, loc="best", title="k")
+        ax.grid(True, axis="y", alpha=0.3)
+        fig.tight_layout()
+
+        out = output_dir / filename
+        fig.savefig(out, dpi=DPI)
+        print(f"Saved: {out}")
+        plt.close(fig)
 
 
 # ============================================================================
@@ -1156,27 +1441,31 @@ def main():
 
     plot_nn_memory_timeseries(timeseries, metadata, results_dir)
 
+    # Block dilution chart (always generated if nn_block_count is populated)
+    plot_block_distribution(results, metadata, results_dir)
 
-    # Plot per-filesystem block distribution if data is present
+    # Per-filesystem block distribution if data is present
     if any(r.get("block_counts_per_fs") for r in results):
         plot_per_fs_block_distribution(results, metadata, results_dir)
 
-    # Plot input-only block distribution if data is present
+    # Input-only block distribution if data is present
     if any(r.get("input_block_counts_per_fs") for r in results):
         plot_input_blocks_per_fs(results, metadata, results_dir)
 
-    # Plot filesystem capacity distribution if data is present
+    # Filesystem capacity distribution if data is present
     if any(r.get("fs_used_mb_per_fs") for r in results):
         plot_fs_capacity_per_node(results, metadata, results_dir)
 
-    # Plot iostat disk I/O metrics if data is present
+    # iostat disk I/O metrics if data is present
     if iostat_data:
-        plot_iostat_await_vs_k(iostat_data, metadata, results_dir)
+        plot_iostat_latency_vs_k(iostat_data, metadata, results_dir)
         plot_iostat_util_vs_k(iostat_data, metadata, results_dir)
         plot_iostat_timeseries(iostat_data, metadata, results_dir)
+        plot_iostat_per_node_comparison(iostat_data, metadata, results_dir)
 
     print()
-    total = 5
+    total = 5  # runtime_vs_k, runtime_vs_total_dirs, speedup, individual_runs, logscale
+    total += 1  # block_distribution (dilution)
     if nn_memory_in_csv:
         total += 2
     if timeseries:
@@ -1184,11 +1473,12 @@ def main():
     if any(r.get("block_counts_per_fs") for r in results):
         total += 1
     if any(r.get("input_block_counts_per_fs") for r in results):
-        total += 1
+        total += 3  # per_fs + boxplot + balance
     if any(r.get("fs_used_mb_per_fs") for r in results):
-        total += 2  # fs_capacity_per_node.png + fs_capacity_balance.png
+        total += 2  # fs_capacity_per_node + fs_capacity_balance
     if iostat_data:
-        total += 3  # iostat_await_vs_k, iostat_util_vs_k, iostat_timeseries
+        # latency_vs_k + util_vs_k + 8 timeseries + 10 per-node
+        total += 2 + 8 + 10
     print(f"All plots generated! ({total} total)")
     print(f"Output directory: {results_dir}")
 
