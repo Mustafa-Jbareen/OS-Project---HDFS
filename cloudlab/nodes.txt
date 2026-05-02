@@ -1,0 +1,5 @@
+ms0628.utah.cloudlab.us
+ms0631.utah.cloudlab.us
+ms0615.utah.cloudlab.us
+ms0617.utah.cloudlab.us
+ms0610.utah.cloudlab.us
