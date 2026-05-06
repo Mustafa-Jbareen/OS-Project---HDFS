@@ -31,24 +31,24 @@ mkdir -p "$RUN_DIR"
 # ============================================================================
 K_REPS=${1:-5}  # Number of repetitions per k value
 
-INPUT_SIZE_GB=1   # 50GB input (using /scratch with 236GB available)
+INPUT_SIZE_GB=1   # 50GB input (Tapuz HDD baseline)
 BLOCK_SIZE=$((32 * 1024 * 1024))    # 32MB in bytes (must match dfs.blocksize in generate-single-dn-configs.sh)
 BLOCK_SIZE_HUMAN="32MB"
 REPLICATION=3                       # Standard HDFS replication
 
 # k values to test: number of loopback storage dirs per DataNode (doubling progression)
-K_VALUES=(1 2 4 8 16 32 64 128 256 512)
+K_VALUES=(1 512)
 
 # Loopback sizing policy
 LOOPBACK_BUDGET_PER_NODE_GB=80
 MIN_IMAGE_SIZE_MB=100  # Minimum image size is 100MB
 
-# Cluster info (CloudLab ARM m400)
+# Cluster info (Tapuz HDD nodes)
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-MASTER_NODE="ms0628.utah.cloudlab.us"
-ALL_NODES=("ms0628.utah.cloudlab.us" "ms0631.utah.cloudlab.us" "ms0615.utah.cloudlab.us" "ms0617.utah.cloudlab.us" "ms0610.utah.cloudlab.us")
-WORKER_NODES=("ms0631.utah.cloudlab.us" "ms0615.utah.cloudlab.us" "ms0617.utah.cloudlab.us" "ms0610.utah.cloudlab.us")
+MASTER_NODE="tapuz14"
+ALL_NODES=("tapuz14" "tapuz10" "tapuz11" "tapuz12" "tapuz13")
+WORKER_NODES=("tapuz10" "tapuz11" "tapuz12" "tapuz13")
 MASTER_HAS_DN=${MASTER_HAS_DN:-0}
 
 DATANODE_NODES=()
@@ -59,7 +59,7 @@ else
 fi
 
 NUM_PHYSICAL_NODES=${#ALL_NODES[@]}
-HADOOP_HOME="/scratch/hadoop/hadoop-3.3.1"
+HADOOP_HOME="/home/mostufa.j/hadoop"
 
 NUM_DATANODE_HOSTS=${#DATANODE_NODES[@]}
 
@@ -199,7 +199,7 @@ start_iostat_monitor() {
     for node in "${DATANODE_NODES[@]}"; do
         local outfile="$IOSTAT_DIR/iostat_k${k}_${node}.log"
 
-                # Detect the block device backing /scratch (handles nvme, dm, and partitions).
+                # Detect the device backing /scratch (Tapuz uses sda1/sda2 partitions, with fallbacks).
                 local scratch_dev
                 scratch_dev=$(ssh "$node" bash -s << 'DEVEOF'
 set +e  # Don't exit on error; we have fallbacks
@@ -270,19 +270,13 @@ fi
 echo "$base"
 DEVEOF
                 )
-                
-                # Log the  detected device for debugging
-                if [[ -z "$scratch_dev" ]]; then
-                    log "  WARNING: device detection failed on $node, using fallback sda"
-                    scratch_dev="sda"
-                else
-                    log "  Device detection: /scratch backed by $scratch_dev"
-                fi
+                [[ -z "$scratch_dev" ]] && scratch_dev="sda"
+                log "  Device detection: /scratch backed by $scratch_dev"
 
-                log "  iostat on $node: monitoring device=${scratch_dev} (/scratch)"
-                # LANG=C fixes timestamp format. -k forces KB/s units; -y skips the boot-time report.
-                # stdbuf ensures output is flushed even if the SSH session is stopped.
-                ssh "$node" "LANG=C stdbuf -oL -eL iostat -dxkty 5 ${scratch_dev}" > "$outfile" 2>/dev/null &
+        log "  iostat on $node: monitoring device=${scratch_dev} (/scratch)"
+        # LANG=C forces MM/DD/YYYY HH:MM:SS AM/PM timestamp format regardless of locale.
+        # Passing the device name restricts iostat to /scratch I/O only (no OS disk noise).
+        ssh "$node" "LANG=C iostat -dxyt 5 ${scratch_dev}" > "$outfile" 2>/dev/null &
         IOSTAT_PIDS+=($!)
     done
     log "  iostat monitor started on ${#DATANODE_NODES[@]} nodes (k=$k)"
@@ -296,7 +290,7 @@ stop_iostat_monitor() {
     done
     # Kill remote iostat processes
     for node in "${DATANODE_NODES[@]}"; do
-        ssh "$node" "pkill -f 'iostat.*-d.*-x.*-t'" 2>/dev/null || true
+        ssh "$node" "pkill -f 'iostat.*-dxyt'" 2>/dev/null || true
     done
     IOSTAT_PIDS=()
     log "  iostat monitor stopped."
@@ -348,115 +342,82 @@ def _parse_ts(ts_str):
             pass
     return None
 
-WINDOW_SLACK_SECONDS = 15
-
-def in_wc_window(ts_str, windows):
+def in_wc_window(ts_str):
     # No windows recorded -> include everything (backward compatible).
-    if not windows:
+    if not wc_windows:
         return True
     dt = _parse_ts(ts_str)
     if dt is None:
         return True
     ts_epoch = int(dt.timestamp())
     # iostat -dxyt 5 averages over the prior 5 s, so the report at ts covers [ts-5, ts].
-    for s, e in windows:
-        if ts_epoch - 5 - WINDOW_SLACK_SECONDS <= e and ts_epoch + WINDOW_SLACK_SECONDS >= s:
+    for s, e in wc_windows:
+        if ts_epoch - 5 <= e and ts_epoch >= s:
             return True
     return False
 
 pattern = os.path.join(iostat_dir, f"iostat_k{k}_*.log")
 log_files = sorted(glob.glob(pattern))
 
-def parse_logs(filter_windows=True):
-    kept = dropped = 0
-    with open(summary_path, "w") as out:
-        out.write("timestamp,node,device,r_per_s,w_per_s,rkB_per_s,wkB_per_s,r_await,w_await,rareq_sz,wareq_sz,aqu_sz,util\n")
+kept = dropped = 0
+with open(summary_path, "w") as out:
+    out.write("timestamp,node,device,r_per_s,w_per_s,rkB_per_s,wkB_per_s,r_await,w_await,rareq_sz,wareq_sz,aqu_sz,util\n")
 
-        for log_file in log_files:
-            basename = os.path.basename(log_file)
-            node = basename.replace(f"iostat_k{k}_", "").replace(".log", "")
+    for log_file in log_files:
+        basename = os.path.basename(log_file)
+        node = basename.replace(f"iostat_k{k}_", "").replace(".log", "")
 
-            current_ts = ""
-            header_indices = {}
+        current_ts = ""
+        header_indices = {}
 
-            with open(log_file) as f:
-                parts = []  # current data-line fields (set before get_num is called)
+        with open(log_file) as f:
+            parts = []  # current data-line fields (set before get_col is called)
 
-                def get_num(names):
-                    for name in names:
-                        idx = header_indices.get(name)
-                        if idx is not None and idx < len(parts):
-                            try:
-                                return float(parts[idx])
-                            except ValueError:
-                                return None
-                    return None
+            def get_col(name, default="0"):
+                idx = header_indices.get(name)
+                if idx is not None and idx < len(parts):
+                    return parts[idx]
+                return default
 
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
 
-                    ts_match = re.match(r"(\d{2}/\d{2}/\d{2,4}\s+\d{2}:\d{2}:\d{2}(?:\s+[AP]M)?)", line)
-                    if ts_match:
-                        current_ts = ts_match.group(1)
-                        continue
+                ts_match = re.match(r"(\d{2}/\d{2}/\d{2,4}\s+\d{2}:\d{2}:\d{2}(?:\s+[AP]M)?)", line)
+                if ts_match:
+                    current_ts = ts_match.group(1)
+                    continue
 
-                    if line.startswith("Device"):
-                        cols = line.split()
-                        for i, col in enumerate(cols):
-                            header_indices[col] = i
-                        continue
+                if line.startswith("Device"):
+                    cols = line.split()
+                    for i, col in enumerate(cols):
+                        header_indices[col] = i
+                    continue
 
-                    parts = line.split()
-                    if not parts or len(parts) < 2:
-                        continue
-                    device = parts[0]
-                    if device.startswith("avg-cpu") or device.startswith("Linux"):
-                        continue
+                parts = line.split()
+                if not parts or len(parts) < 2:
+                    continue
+                device = parts[0]
+                if not device.startswith("sd"):
+                    continue
 
-                    if filter_windows and not in_wc_window(current_ts, wc_windows):
-                        dropped += 1
-                        continue
+                if not in_wc_window(current_ts):
+                    dropped += 1
+                    continue
 
-                    r_per_s = get_num(["r/s"]) or 0.0
-                    w_per_s = get_num(["w/s"]) or 0.0
+                row = [
+                    current_ts, node, device,
+                    get_col("r/s"), get_col("w/s"),
+                    get_col("rkB/s"), get_col("wkB/s"),
+                    get_col("r_await"), get_col("w_await"),
+                    get_col("rareq-sz"), get_col("wareq-sz"),
+                    get_col("aqu-sz"), get_col("%util"),
+                ]
+                out.write(",".join(row) + "\n")
+                kept += 1
 
-                    rkB = get_num(["rkB/s", "rKB/s"])
-                    if rkB is None:
-                        rMB = get_num(["rMB/s"])
-                        rkB = rMB * 1024 if rMB is not None else 0.0
-                    wkB = get_num(["wkB/s", "wKB/s"])
-                    if wkB is None:
-                        wMB = get_num(["wMB/s"])
-                        wkB = wMB * 1024 if wMB is not None else 0.0
-
-                    row = [
-                        current_ts, node, device,
-                        f"{r_per_s}", f"{w_per_s}",
-                        f"{rkB}", f"{wkB}",
-                        f"{get_num(['r_await']) or 0.0}", f"{get_num(['w_await']) or 0.0}",
-                        f"{get_num(['rareq-sz']) or 0.0}", f"{get_num(['wareq-sz']) or 0.0}",
-                        f"{get_num(['aqu-sz']) or 0.0}", f"{get_num(['%util']) or 0.0}",
-                    ]
-                    out.write(",".join(row) + "\n")
-                    kept += 1
-
-    return kept, dropped
-
-try:
-    kept, dropped = parse_logs(filter_windows=True)
-    if wc_windows and kept == 0:
-        # If clocks are skewed or timestamps were missing, fall back to no filtering.
-        kept, dropped = parse_logs(filter_windows=False)
-        print(f"WARNING: no iostat samples matched WordCount windows for k={k}; wrote unfiltered data")
-    
-    print(f"Parsed iostat summary: {summary_path} (kept={kept}, dropped_outside_wc={dropped}, windows={len(wc_windows)})")
-except Exception as e:
-    import traceback
-    print(f"ERROR parsing iostat for k={k}: {e}")
-    traceback.print_exc()
-    sys.exit(1)
+print(f"Parsed iostat summary: {summary_path} (kept={kept}, dropped_outside_wc={dropped}, windows={len(wc_windows)})")
 IOSTAT_PY
 
     log "  iostat logs parsed: $summary_csv"
@@ -932,7 +893,8 @@ log "============================================================"
 log "Restoring normal single-DataNode cluster..."
 log "============================================================"
 
-unset HADOOP_CONF_DIR
+printf "%s\n" "${WORKER_NODES[@]}" > "$CONFIG_DIR/workers"
+export HADOOP_CONF_DIR="$CONFIG_DIR"
 
 rm -rf /scratch/hadoop_data/namenode/current 2>/dev/null || true
 rm -rf /scratch/hadoop_data/datanode/current 2>/dev/null || true

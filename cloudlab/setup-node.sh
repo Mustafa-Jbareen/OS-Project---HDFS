@@ -12,13 +12,15 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo bash "$0" "$@"
 fi
 
-SUDO_USER_NAME=${SUDO_USER:-$(logname 2>/dev/null || echo "$USER")}
+# Get the actual user running the script (set by sudo)
+ACTUAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo "root")}"
+echo "Running as root, original user: $ACTUAL_USER"
 
 HADOOP_VERSION=${HADOOP_VERSION:-3.3.1}
 HADOOP_BASE=/mydata/hadoop
 HADOOP_TARGET="$HADOOP_BASE/hadoop-$HADOOP_VERSION"
 
-echo "Setting up CloudLab node for user: $SUDO_USER_NAME"
+echo "Setting up CloudLab node for user: $ACTUAL_USER"
 echo "Note: m400 has 120 GB total disk (~50 GB available after OS)"
 
 apt-get update -y
@@ -34,7 +36,7 @@ fi
 if [ -d /mydata ]; then
     # Create Hadoop and experiment directories
     mkdir -p /mydata/hadoop /mydata/hadoop_data /mydata/hdfs_loop /mydata/results /mydata/tmp
-    chown -R "$SUDO_USER_NAME":"$SUDO_USER_NAME" /mydata || true
+    chown -R "$ACTUAL_USER" /mydata || true
 
     # Bind /mydata to /scratch so existing scripts using /scratch continue to work
     mkdir -p /scratch
@@ -47,7 +49,7 @@ if [ -d /mydata ]; then
 else
     echo "WARNING: /mydata not created. Falling back to /tmp for experiment data."
     mkdir -p /tmp/hadoop /tmp/hadoop_data /tmp/hdfs_loop /tmp/results /tmp/tmp
-    chown -R "$SUDO_USER_NAME":"$SUDO_USER_NAME" /tmp/hadoop /tmp/hadoop_data /tmp/hdfs_loop /tmp/results /tmp/tmp || true
+    chown -R "$ACTUAL_USER" /tmp/hadoop /tmp/hadoop_data /tmp/hdfs_loop /tmp/results /tmp/tmp || true
 fi
 
 # Install Hadoop under /mydata (or /tmp if /mydata unavailable)
@@ -60,7 +62,7 @@ if [ ! -d "$HADOOP_TARGET" ]; then
         wget -q https://archive.apache.org/dist/hadoop/common/hadoop-$HADOOP_VERSION/$HADOOP_TGZ
     fi
     tar -xzf "$HADOOP_TGZ" -C "$HADOOP_BASE"
-    chown -R "$SUDO_USER_NAME":"$SUDO_USER_NAME" "$HADOOP_BASE"
+    chown -R "$ACTUAL_USER" "$HADOOP_BASE"
 fi
 
 # Fallback: also store Hadoop path in /tmp in case /mydata bind fails
@@ -70,12 +72,17 @@ else
     HADOOP_PATH=/tmp/hadoop/hadoop-$HADOOP_VERSION
 fi
 
-# Set HADOOP_HOME in /etc/profile.d so experiment scripts find it
+# Set HADOOP_HOME and JAVA_HOME in /etc/profile.d so experiment scripts find them
+# Find Java installation
+JAVA_HOME=$(update-alternatives --list java 2>/dev/null | head -1 | xargs dirname | xargs dirname) || JAVA_HOME="/usr/lib/jvm/java-11-openjdk-$(uname -m)"
+
 cat > /etc/profile.d/hadoop.sh <<'ENV'
 #!/bin/sh
+export JAVA_HOME=JAVA_HOME_PLACEHOLDER
 export HADOOP_HOME=HADOOP_PATH_PLACEHOLDER
 export PATH=$HADOOP_HOME/bin:$HADOOP_HOME/sbin:$PATH
 ENV
+sed -i "s|JAVA_HOME_PLACEHOLDER|$JAVA_HOME|g" /etc/profile.d/hadoop.sh
 sed -i "s|HADOOP_PATH_PLACEHOLDER|$HADOOP_PATH|g" /etc/profile.d/hadoop.sh
 chmod +x /etc/profile.d/hadoop.sh
 

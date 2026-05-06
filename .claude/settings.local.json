@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Read(//c/Users/ROG STRIX/OneDrive/سطح المكتب/Technion CS Courses/Dan/hadoop/my_scripts/**)",
-      "Read(//c/Users/ROG STRIX/OneDrive/سطح المكتب/Technion CS Courses/Dan/hadoop/my_scripts/$1>100 {print \"rkB/**)",
-      "Bash(PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python plot-results.py \"c:/Users/ROG STRIX/OneDrive/سطح المكتب/Technion CS Courses/Dan/hadoop/storage_virtualization_loopback/run_2026-04-12_00-01-43\")"
-    ]
-  }
-}

@@ -32,10 +32,10 @@ IMAGE_SIZE_MB=${2:-30720}
 DN_HEAP_MB=${3:-5500}
 REPLICATION=${4:-3}
 
-# Cluster nodes (CloudLab ARM m400)
-MASTER_NODE="ms0628.utah.cloudlab.us"
-ALL_NODES=("ms0628.utah.cloudlab.us" "ms0631.utah.cloudlab.us" "ms0615.utah.cloudlab.us" "ms0617.utah.cloudlab.us" "ms0610.utah.cloudlab.us")
-WORKER_NODES=("ms0631.utah.cloudlab.us" "ms0615.utah.cloudlab.us" "ms0617.utah.cloudlab.us" "ms0610.utah.cloudlab.us")
+# Cluster nodes (Tapuz HDD nodes)
+MASTER_NODE="tapuz14"
+ALL_NODES=("tapuz14" "tapuz10" "tapuz11" "tapuz12" "tapuz13")
+WORKER_NODES=("tapuz10" "tapuz11" "tapuz12" "tapuz13")
 MASTER_HAS_DN=${MASTER_HAS_DN:-0}
 
 DATANODE_NODES=()
@@ -50,7 +50,7 @@ if [[ "$MASTER_HAS_DN" == "0" ]]; then
 fi
 
 # Paths
-HADOOP_HOME="/scratch/hadoop/hadoop-3.3.1"
+HADOOP_HOME="/home/mostufa.j/hadoop"
 HADOOP_DATA_DIR="/scratch/hadoop_data"
 CONFIG_DIR="/scratch/tmp/hadoop_single_dn_k_dirs"
 IMAGE_DIR="/scratch/loop_images"
@@ -340,7 +340,10 @@ done
 # ============================================================================
 echo ""
 echo "=== STEP 7: Starting YARN ==="
-unset HADOOP_CONF_DIR
+
+# Keep NodeManagers on worker nodes only (CloudLab-like behavior).
+printf "%s\n" "${WORKER_NODES[@]}" > "$CONFIG_DIR/workers"
+export HADOOP_CONF_DIR="$CONFIG_DIR"
 start-yarn.sh 2>/dev/null || true
 mapred --daemon start historyserver 2>/dev/null || true
 
@@ -360,8 +363,6 @@ if (( JHS_WAIT_ELAPSED >= JHS_WAIT_MAX )); then
     echo "WARNING: JobHistoryServer did not appear within ${JHS_WAIT_MAX}s"
 fi
 echo "YARN started."
-
-export HADOOP_CONF_DIR="$CONFIG_DIR"
 
 # ============================================================================
 # STEP 8: Wait for DataNodes to register

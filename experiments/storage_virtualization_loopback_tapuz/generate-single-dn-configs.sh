@@ -26,9 +26,9 @@ MOUNT_BASE=${3:-/scratch/hdfs_loop}
 DN_HEAP_MB=${4:-4096}
 REPLICATION=${5:-3}
 
-HADOOP_HOME=/scratch/hadoop/hadoop-3.3.1
+HADOOP_HOME=/home/mostufa.j/hadoop
 HADOOP_CONF="$HADOOP_HOME/etc/hadoop"
-MASTER_NODE="ms0628.utah.cloudlab.us"
+MASTER_NODE="tapuz14"
 NAMENODE_PORT=9000
 JOBHISTORY_RPC_PORT=10020
 JOBHISTORY_WEB_PORT=19888
