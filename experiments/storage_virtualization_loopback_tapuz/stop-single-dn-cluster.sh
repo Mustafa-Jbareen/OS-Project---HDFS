@@ -5,16 +5,19 @@
 #              filesystems on all nodes.
 #
 # USAGE: bash stop-single-dn-cluster.sh [max_k]
-#   max_k - Maximum k value to clean up loopback FSes (default: 512)
+#   max_k - Maximum k value to clean up loopback FSes (default: 1024)
 ################################################################################
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/cluster.conf"
 
-MAX_K=${1:-512}
+MAX_K=${1:-1024}
 
+# Cluster nodes
+MASTER_NODE="tapuz14"
+ALL_NODES=("tapuz14" "tapuz10" "tapuz11" "tapuz12" "tapuz13")
+WORKER_NODES=("tapuz10" "tapuz11" "tapuz12" "tapuz13")
 MASTER_HAS_DN=${MASTER_HAS_DN:-0}
 
 DATANODE_NODES=()
@@ -23,6 +26,9 @@ if [[ "$MASTER_HAS_DN" == "0" ]]; then
 else
     DATANODE_NODES=("${ALL_NODES[@]}")
 fi
+
+IMAGE_DIR="/scratch/loop_images"
+MOUNT_BASE="/scratch/hdfs_loop"
 
 echo "============================================================"
 echo "Stopping Single DataNode Cluster"

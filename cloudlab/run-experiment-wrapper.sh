@@ -28,32 +28,12 @@ cd "$EXP_DIR"
 
 echo "Invoking run-experiment-loopback-fs.sh with args: $*"
 
-# If a nodes file exists at cloudlab/nodes.txt, patch the experiment script's
-# MASTER_NODE and ALL_NODES definitions to match the CloudLab hostnames.
-NODES_FILE="$REPO_DIR/cloudlab/nodes.txt"
+NODES_FILE="${NODES_FILE:-$REPO_DIR/cloudlab/nodes.txt}"
+export NODES_FILE
 if [ -f "$NODES_FILE" ]; then
-    echo "Found nodes file: $NODES_FILE — patching experiment script hostnames"
-    mapfile -t NODES < "$NODES_FILE"
-    if [ ${#NODES[@]} -ge 1 ]; then
-        MASTER_HOST=${NODES[0]}
-        # Build replacement ALL_NODES line: ALL_NODES=("host1" "host2" ...)
-        ALL_NODES_LINE="ALL_NODES=($(printf '"%s" ' "${NODES[@]}"))"
-
-        # Replace MASTER_NODE line if present
-        if grep -q "^MASTER_NODE=" run-experiment-loopback-fs.sh; then
-            sed -i "s/^MASTER_NODE=.*/MASTER_NODE=\"$MASTER_HOST\"/" run-experiment-loopback-fs.sh
-        fi
-
-        # Replace ALL_NODES line if present
-        if grep -q "^ALL_NODES=(" run-experiment-loopback-fs.sh; then
-            # escape slashes & ampersands for sed
-            esc=$(printf '%s' "$ALL_NODES_LINE" | sed -e 's/[\/&]/\\&/g')
-            sed -i "s/^ALL_NODES=.*/$esc/" run-experiment-loopback-fs.sh
-        fi
-        echo "Patched MASTER_NODE=$MASTER_HOST and ALL_NODES to: ${NODES[*]}"
-    else
-        echo "nodes.txt is empty — skipping hostname patch"
-    fi
+    echo "Using nodes file: $NODES_FILE"
+else
+    echo "nodes.txt not found; using script defaults"
 fi
 
 bash run-experiment-loopback-fs.sh "$@"

@@ -21,11 +21,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR/../.."
 WORDCOUNT_DIR="$SCRIPT_DIR/../wordcount"
 
-# cluster.conf defines: MASTER_NODE, ALL_NODES, WORKER_NODES,
-# STORAGE_BASE, HADOOP_HOME, IMAGE_DIR, MOUNT_BASE, HADOOP_DATA_DIR,
-# TMP_BASE, CONFIG_DIR.
-source "$SCRIPT_DIR/cluster.conf"
-
 RESULTS_BASE="${RESULTS_BASE:-$PROJECT_ROOT/results/storage_virtualization_loopback}"
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 RUN_DIR="$RESULTS_BASE/run_$TIMESTAMP"
@@ -34,29 +29,28 @@ mkdir -p "$RUN_DIR"
 # ============================================================================
 # PARAMETERS
 # ============================================================================
-K_REPS=${1:-3}  # Number of repetitions per k value
+K_REPS=${1:-5}  # Number of repetitions per k value
 
-# c6620 bring-up profile: 1GB input, just k=1 vs k=512 to verify plumbing.
-# Bump INPUT_SIZE_GB back to 50 (and widen K_VALUES) once verified.
-INPUT_SIZE_GB=${INPUT_SIZE_GB:-1}
-BLOCK_SIZE=$((32 * 1024 * 1024))    # 32MB; matches HDD baseline
+INPUT_SIZE_GB=1   # 50GB input (Tapuz HDD baseline)
+BLOCK_SIZE=$((32 * 1024 * 1024))    # 32MB in bytes (must match dfs.blocksize in generate-single-dn-configs.sh)
 BLOCK_SIZE_HUMAN="32MB"
 REPLICATION=3                       # Standard HDFS replication
 
-# k values to test (just two for c6620 bring-up)
+# k values to test: number of loopback storage dirs per DataNode (doubling progression)
 K_VALUES=(1 512)
 
 # Loopback sizing policy
 LOOPBACK_BUDGET_PER_NODE_GB=80
 MIN_IMAGE_SIZE_MB=100  # Minimum image size is 100MB
 
-# WordCount mode:
-#   real    -> stock hadoop-mapreduce-examples wordcount (full CPU work)
-#   trivial -> custom no-tokenization mapper, isolates I/O+framework cost
-WORDCOUNT_MODE=${WORDCOUNT_MODE:-real}
-TRIVIAL_WC_JAR="${TRIVIAL_WC_JAR:-$WORDCOUNT_DIR/trivial/trivial-wordcount.jar}"
+# Cluster info (Tapuz HDD nodes)
+REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+MASTER_NODE="tapuz14"
+ALL_NODES=("tapuz14" "tapuz10" "tapuz11" "tapuz12" "tapuz13")
+WORKER_NODES=("tapuz10" "tapuz11" "tapuz12" "tapuz13")
 MASTER_HAS_DN=${MASTER_HAS_DN:-0}
+
 DATANODE_NODES=()
 if [[ "$MASTER_HAS_DN" == "0" ]]; then
     DATANODE_NODES=("${WORKER_NODES[@]}")
@@ -65,7 +59,11 @@ else
 fi
 
 NUM_PHYSICAL_NODES=${#ALL_NODES[@]}
+HADOOP_HOME="/home/mostufa.j/hadoop"
+
 NUM_DATANODE_HOSTS=${#DATANODE_NODES[@]}
+
+CONFIG_DIR="/scratch/tmp/hadoop_single_dn_k_dirs"
 
 # NameNode JMX endpoint for memory monitoring
 NAMENODE_HOST="$MASTER_NODE"
@@ -201,53 +199,84 @@ start_iostat_monitor() {
     for node in "${DATANODE_NODES[@]}"; do
         local outfile="$IOSTAT_DIR/iostat_k${k}_${node}.log"
 
-                # Detect the physical block device backing $STORAGE_BASE
-                # (handles LVM-on-NVMe -> /dev/mapper/X -> dm-N -> nvme0n1,
-                # plain partitions like sda1 -> sda, nvme0n1p3 -> nvme0n1).
-                # Strategy: findmnt -> lsblk -snro NAME walks the dependency
-                # tree down to the physical device.
+                # Detect the device backing /scratch (Tapuz uses sda1/sda2 partitions, with fallbacks).
                 local scratch_dev
-                scratch_dev=$(ssh "$node" "STORAGE_BASE='$STORAGE_BASE' bash -s" << 'DEVEOF'
-set +e
-mp="${STORAGE_BASE:-/scratch}"
+                scratch_dev=$(ssh "$node" bash -s << 'DEVEOF'
+set +e  # Don't exit on error; we have fallbacks
 
-# -T <path> finds the mount containing <path>; works when $mp is a symlink
-# (c6620 has /scratch -> /mydata).
-src=$(findmnt -T "$mp" -no SOURCE 2>/dev/null)
-[ -z "$src" ] && src=$(df "$mp" 2>/dev/null | awk 'NR==2{print $1}')
+# Method 1: Try findmnt to get the source device
+src=$(findmnt -no SOURCE /scratch 2>/dev/null)
 
-# Walk down to the leaf physical device(s). For LVM/dm, lsblk -s with the
-# source device prints all underlying devices. The last NVMe / disk / SSD
-# is the physical one we want to monitor.
-phys=""
-if [ -n "$src" ]; then
-    phys=$(lsblk -snro NAME,TYPE "$src" 2>/dev/null \
-           | awk '$2=="disk"{print $1}' | head -1)
+# Method 2: If findmnt fails, try df
+if [[ -z "$src" ]]; then
+    src=$(df /scratch 2>/dev/null | awk 'NR==2{print $1}')
 fi
 
-# Fallbacks: common physical device names
-if [ -z "$phys" ]; then
-    for c in nvme0n1 sda vda; do
-        if [ -b "/dev/$c" ]; then phys=$c; break; fi
+# Method 3: Try to resolve to a real /dev/ path
+if [[ -n "$src" && "$src" != /* ]]; then
+    # If src is not a /dev/ path, try to find it via lsblk
+    resolved=$(lsblk -n -o NAME,MOUNTPOINT 2>/dev/null | grep "/scratch" | awk '{print $1}')
+    if [[ -n "$resolved" ]]; then
+        src="/dev/$resolved"
+    fi
+fi
+
+# Fallback to readlink to resolve symlinks/mountpoints
+if [[ -n "$src" ]]; then
+    src=$(readlink -f "$src" 2>/dev/null || echo "$src")
+fi
+
+# Method 4: Use lsblk to find any mounted device at /scratch
+if [[ -z "$src" ]] || [[ ! -b "$src" ]]; then
+    src=$(lsblk -rn -o NAME,MOUNTPOINT 2>/dev/null | awk '$2 == "/scratch" {print "/dev/" $1}' | head -1)
+fi
+
+base=""
+if [[ -n "$src" && -b "$src" ]]; then
+    # src is now a valid /dev/ path
+    base=$(basename "$src")
+    
+    # Remove partition suffix (e.g., "sda1" -> "sda", "nvme0n1p1" -> "nvme0n1")
+    if [[ "$base" =~ ^([a-z]+[0-9]*)p?[0-9]+$ ]]; then
+        base="${BASH_REMATCH[1]}"
+    fi
+    
+    # If it's a dm device, try to find the backing device
+    if [[ "$base" =~ ^dm- ]]; then
+        parent=$(lsblk -rn -o NAME,TYPE /dev/"$base" 2>/dev/null | grep -v "^$base" | head -1 | awk '{print $1}')
+        # If parent found, use it; else keep dm device
+        if [[ -n "$parent" ]]; then
+            if [[ "$parent" =~ ^([a-z]+[0-9]*)p?[0-9]*$ ]]; then
+                base="${BASH_REMATCH[1]}"
+            else
+                base="$parent"
+            fi
+        fi
+    fi
+fi
+
+# Final fallback: if device is still empty or not valid, use sda
+if [[ -z "$base" ]]; then
+    # Last resort: check if any of these common devices exist
+    for candidate in sda nvme0n1 vda; do
+        if [[ -b /dev/$candidate ]]; then
+            base="$candidate"
+            break
+        fi
     done
+    [[ -z "$base" ]] && base="sda"  # Ultimate fallback
 fi
-[ -z "$phys" ] && phys=sda
-echo "$phys"
+
+echo "$base"
 DEVEOF
                 )
-                
-                # Log the  detected device for debugging
-                if [[ -z "$scratch_dev" ]]; then
-                    log "  WARNING: device detection failed on $node, using fallback sda"
-                    scratch_dev="sda"
-                else
-                    log "  Device detection: $STORAGE_BASE backed by $scratch_dev"
-                fi
+                [[ -z "$scratch_dev" ]] && scratch_dev="sda"
+                log "  Device detection: /scratch backed by $scratch_dev"
 
-                log "  iostat on $node: monitoring device=${scratch_dev} ($STORAGE_BASE)"
-                # LANG=C fixes timestamp format. -k forces KB/s units; -y skips the boot-time report.
-                # stdbuf ensures output is flushed even if the SSH session is stopped.
-                ssh "$node" "LANG=C stdbuf -oL -eL iostat -dxkty 5 ${scratch_dev}" > "$outfile" 2>/dev/null &
+        log "  iostat on $node: monitoring device=${scratch_dev} (/scratch)"
+        # LANG=C forces MM/DD/YYYY HH:MM:SS AM/PM timestamp format regardless of locale.
+        # Passing the device name restricts iostat to /scratch I/O only (no OS disk noise).
+        ssh "$node" "LANG=C iostat -dxyt 5 ${scratch_dev}" > "$outfile" 2>/dev/null &
         IOSTAT_PIDS+=($!)
     done
     log "  iostat monitor started on ${#DATANODE_NODES[@]} nodes (k=$k)"
@@ -261,7 +290,7 @@ stop_iostat_monitor() {
     done
     # Kill remote iostat processes
     for node in "${DATANODE_NODES[@]}"; do
-        ssh "$node" "pkill -f 'iostat.*-d.*-x.*-t'" 2>/dev/null || true
+        ssh "$node" "pkill -f 'iostat.*-dxyt'" 2>/dev/null || true
     done
     IOSTAT_PIDS=()
     log "  iostat monitor stopped."
@@ -313,115 +342,82 @@ def _parse_ts(ts_str):
             pass
     return None
 
-WINDOW_SLACK_SECONDS = 15
-
-def in_wc_window(ts_str, windows):
+def in_wc_window(ts_str):
     # No windows recorded -> include everything (backward compatible).
-    if not windows:
+    if not wc_windows:
         return True
     dt = _parse_ts(ts_str)
     if dt is None:
         return True
     ts_epoch = int(dt.timestamp())
     # iostat -dxyt 5 averages over the prior 5 s, so the report at ts covers [ts-5, ts].
-    for s, e in windows:
-        if ts_epoch - 5 - WINDOW_SLACK_SECONDS <= e and ts_epoch + WINDOW_SLACK_SECONDS >= s:
+    for s, e in wc_windows:
+        if ts_epoch - 5 <= e and ts_epoch >= s:
             return True
     return False
 
 pattern = os.path.join(iostat_dir, f"iostat_k{k}_*.log")
 log_files = sorted(glob.glob(pattern))
 
-def parse_logs(filter_windows=True):
-    kept = dropped = 0
-    with open(summary_path, "w") as out:
-        out.write("timestamp,node,device,r_per_s,w_per_s,rkB_per_s,wkB_per_s,r_await,w_await,rareq_sz,wareq_sz,aqu_sz,util\n")
+kept = dropped = 0
+with open(summary_path, "w") as out:
+    out.write("timestamp,node,device,r_per_s,w_per_s,rkB_per_s,wkB_per_s,r_await,w_await,rareq_sz,wareq_sz,aqu_sz,util\n")
 
-        for log_file in log_files:
-            basename = os.path.basename(log_file)
-            node = basename.replace(f"iostat_k{k}_", "").replace(".log", "")
+    for log_file in log_files:
+        basename = os.path.basename(log_file)
+        node = basename.replace(f"iostat_k{k}_", "").replace(".log", "")
 
-            current_ts = ""
-            header_indices = {}
+        current_ts = ""
+        header_indices = {}
 
-            with open(log_file) as f:
-                parts = []  # current data-line fields (set before get_num is called)
+        with open(log_file) as f:
+            parts = []  # current data-line fields (set before get_col is called)
 
-                def get_num(names):
-                    for name in names:
-                        idx = header_indices.get(name)
-                        if idx is not None and idx < len(parts):
-                            try:
-                                return float(parts[idx])
-                            except ValueError:
-                                return None
-                    return None
+            def get_col(name, default="0"):
+                idx = header_indices.get(name)
+                if idx is not None and idx < len(parts):
+                    return parts[idx]
+                return default
 
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
 
-                    ts_match = re.match(r"(\d{2}/\d{2}/\d{2,4}\s+\d{2}:\d{2}:\d{2}(?:\s+[AP]M)?)", line)
-                    if ts_match:
-                        current_ts = ts_match.group(1)
-                        continue
+                ts_match = re.match(r"(\d{2}/\d{2}/\d{2,4}\s+\d{2}:\d{2}:\d{2}(?:\s+[AP]M)?)", line)
+                if ts_match:
+                    current_ts = ts_match.group(1)
+                    continue
 
-                    if line.startswith("Device"):
-                        cols = line.split()
-                        for i, col in enumerate(cols):
-                            header_indices[col] = i
-                        continue
+                if line.startswith("Device"):
+                    cols = line.split()
+                    for i, col in enumerate(cols):
+                        header_indices[col] = i
+                    continue
 
-                    parts = line.split()
-                    if not parts or len(parts) < 2:
-                        continue
-                    device = parts[0]
-                    if device.startswith("avg-cpu") or device.startswith("Linux"):
-                        continue
+                parts = line.split()
+                if not parts or len(parts) < 2:
+                    continue
+                device = parts[0]
+                if not device.startswith("sd"):
+                    continue
 
-                    if filter_windows and not in_wc_window(current_ts, wc_windows):
-                        dropped += 1
-                        continue
+                if not in_wc_window(current_ts):
+                    dropped += 1
+                    continue
 
-                    r_per_s = get_num(["r/s"]) or 0.0
-                    w_per_s = get_num(["w/s"]) or 0.0
+                row = [
+                    current_ts, node, device,
+                    get_col("r/s"), get_col("w/s"),
+                    get_col("rkB/s"), get_col("wkB/s"),
+                    get_col("r_await"), get_col("w_await"),
+                    get_col("rareq-sz"), get_col("wareq-sz"),
+                    get_col("aqu-sz"), get_col("%util"),
+                ]
+                out.write(",".join(row) + "\n")
+                kept += 1
 
-                    rkB = get_num(["rkB/s", "rKB/s"])
-                    if rkB is None:
-                        rMB = get_num(["rMB/s"])
-                        rkB = rMB * 1024 if rMB is not None else 0.0
-                    wkB = get_num(["wkB/s", "wKB/s"])
-                    if wkB is None:
-                        wMB = get_num(["wMB/s"])
-                        wkB = wMB * 1024 if wMB is not None else 0.0
-
-                    row = [
-                        current_ts, node, device,
-                        f"{r_per_s}", f"{w_per_s}",
-                        f"{rkB}", f"{wkB}",
-                        f"{get_num(['r_await']) or 0.0}", f"{get_num(['w_await']) or 0.0}",
-                        f"{get_num(['rareq-sz']) or 0.0}", f"{get_num(['wareq-sz']) or 0.0}",
-                        f"{get_num(['aqu-sz']) or 0.0}", f"{get_num(['%util']) or 0.0}",
-                    ]
-                    out.write(",".join(row) + "\n")
-                    kept += 1
-
-    return kept, dropped
-
-try:
-    kept, dropped = parse_logs(filter_windows=True)
-    if wc_windows and kept == 0:
-        # If clocks are skewed or timestamps were missing, fall back to no filtering.
-        kept, dropped = parse_logs(filter_windows=False)
-        print(f"WARNING: no iostat samples matched WordCount windows for k={k}; wrote unfiltered data")
-    
-    print(f"Parsed iostat summary: {summary_path} (kept={kept}, dropped_outside_wc={dropped}, windows={len(wc_windows)})")
-except Exception as e:
-    import traceback
-    print(f"ERROR parsing iostat for k={k}: {e}")
-    traceback.print_exc()
-    sys.exit(1)
+print(f"Parsed iostat summary: {summary_path} (kept={kept}, dropped_outside_wc={dropped}, windows={len(wc_windows)})")
 IOSTAT_PY
 
     log "  iostat logs parsed: $summary_csv"
@@ -511,9 +507,7 @@ echo "Run ID:           $TIMESTAMP"
 echo "Input size:       ${INPUT_SIZE_GB}GB"
 echo "Block size:       $BLOCK_SIZE_HUMAN"
 echo "Replication:      $REPLICATION"
-echo "WordCount mode:   $WORDCOUNT_MODE"
 echo "Master has DN:    $MASTER_HAS_DN"
-echo "Storage base:     $STORAGE_BASE  (HADOOP_HOME=$HADOOP_HOME)"
 echo "Loopback budget:  ${LOOPBACK_BUDGET_PER_NODE_GB}GB/node (min ${MIN_IMAGE_SIZE_MB}MB/image)"
 echo "Physical nodes:   $NUM_PHYSICAL_NODES (${ALL_NODES[*]})"
 echo "DataNode hosts:   $NUM_DATANODE_HOSTS (${DATANODE_NODES[*]})"
@@ -539,7 +533,6 @@ echo ""
 export LOOPBACK_BUDGET_PER_NODE_GB MIN_IMAGE_SIZE_MB K_REPS
 export TIMESTAMP INPUT_SIZE_GB BLOCK_SIZE BLOCK_SIZE_HUMAN REPLICATION
 export NUM_PHYSICAL_NODES RUN_DIR NUM_DATANODE_HOSTS MASTER_HAS_DN
-export WORDCOUNT_MODE STORAGE_BASE
 
 K_VALUES_CSV=$(IFS=,; echo "${K_VALUES[*]}")
 NODE_NAMES_CSV=$(IFS=,; echo "${ALL_NODES[*]}")
@@ -573,8 +566,6 @@ meta = {
     "loopback_budget_per_node_gb": int(os.environ["LOOPBACK_BUDGET_PER_NODE_GB"]),
     "min_image_size_mb": int(os.environ["MIN_IMAGE_SIZE_MB"]),
     "repetitions": int(os.environ["K_REPS"]),
-    "wordcount_mode": os.environ.get("WORDCOUNT_MODE", "real"),
-    "storage_base": os.environ.get("STORAGE_BASE", "/scratch"),
     "start_time": datetime.now().astimezone().isoformat(timespec="seconds"),
 }
 
@@ -624,13 +615,6 @@ for k in "${K_VALUES[@]}"; do
     NN_BLOCK_COUNT=$(echo "$NN_BEFORE" | awk '{print $3}')
     log "  NN heap before: ${NN_HEAP_BEFORE}MB, blocks: $NN_BLOCK_COUNT"
 
-    # -- Step 2.5: Fragmentation snapshot (mentor's filefrag check) --
-    # Captures extent counts of loopback images + sampled HDFS block files
-    # AFTER input is on disk, BEFORE any MapReduce work touches it.
-    log "Measuring fragmentation (filefrag) for k=$k..."
-    bash "$SCRIPT_DIR/measure-fragmentation.sh" "$k" "$RUN_DIR/fragmentation" "${DATANODE_NODES[@]}" 2>&1 | tee -a "$LOG_FILE" || \
-        log "  WARNING: fragmentation step failed for k=$k (continuing)"
-
     # Monitor NameNode memory while WordCount runs
     NN_MONITOR_CSV="$NN_MEMORY_DIR/nn_memory_k${k}.csv"
     start_nn_monitor "$NN_MONITOR_CSV" 5
@@ -670,28 +654,16 @@ for k in "${K_VALUES[@]}"; do
         bash "$WORDCOUNT_DIR/generate-input.sh" "$((INPUT_SIZE_GB * 1024))" "$BLOCK_SIZE" 2>/dev/null || true
         sleep 2
 
-        # Time the WordCount job (real or trivial depending on $WORDCOUNT_MODE)
+        # Time the WordCount job
         START_TIME=$(date +%s.%N)
         WC_START_EPOCH=$(date +%s)
 
-        if [[ "$WORDCOUNT_MODE" == "trivial" ]]; then
-            if [[ ! -f "$TRIVIAL_WC_JAR" ]]; then
-                log "  ERROR: WORDCOUNT_MODE=trivial but jar missing: $TRIVIAL_WC_JAR"
-                exit 1
-            fi
-            hadoop jar "$TRIVIAL_WC_JAR" TrivialWordCount \
-                -D mapreduce.jobhistory.address=${MASTER_NODE}:10020 \
-                -D mapreduce.jobhistory.webapp.address=${MASTER_NODE}:19888 \
-                /user/$USER/wordcount/input \
-                /user/$USER/wordcount/output 2>&1 | tee -a "$LOG_FILE"
-        else
-            hadoop jar "$HADOOP_HOME/share/hadoop/mapreduce/hadoop-mapreduce-examples-"*.jar \
-                wordcount \
-                -D mapreduce.jobhistory.address=${MASTER_NODE}:10020 \
-                -D mapreduce.jobhistory.webapp.address=${MASTER_NODE}:19888 \
-                /user/$USER/wordcount/input \
-                /user/$USER/wordcount/output 2>&1 | tee -a "$LOG_FILE"
-        fi
+        hadoop jar "$HADOOP_HOME/share/hadoop/mapreduce/hadoop-mapreduce-examples-"*.jar \
+            wordcount \
+            -D mapreduce.jobhistory.address=${MASTER_NODE}:10020 \
+            -D mapreduce.jobhistory.webapp.address=${MASTER_NODE}:19888 \
+            /user/$USER/wordcount/input \
+            /user/$USER/wordcount/output 2>&1 | tee -a "$LOG_FILE"
 
         WC_END_EPOCH=$(date +%s)
         END_TIME=$(date +%s.%N)
@@ -737,8 +709,8 @@ for k in "${K_VALUES[@]}"; do
     > "$RUN_DIR/block_counts_tmp.txt"
     for NODE in "${DATANODE_NODES[@]}"; do
         # Count block DATA files only (exclude .meta checksum files; each block has both)
-        # Path: ${MOUNT_BASE}/dn<i>/hdfs_data/current/BP-<pool-id>/current/.../blk_*
-        ssh "$NODE" "for i in {1..$k}; do cnt=\$(find ${MOUNT_BASE}/dn\$i/hdfs_data -name 'blk_*' -not -name '*.meta' -type f 2>/dev/null | wc -l); echo -n \"\$cnt;\"; done" 2>/dev/null >> "$RUN_DIR/block_counts_tmp.txt"
+        # Path: /scratch/hdfs_loop/dn<i>/hdfs_data/current/BP-<pool-id>/current/.../blk_*
+        ssh "$NODE" 'for i in {1..'"$k"'}; do cnt=$(find /scratch/hdfs_loop/dn"$i"/hdfs_data -name "blk_*" -not -name "*.meta" -type f 2>/dev/null | wc -l); echo -n "$cnt;"; done' 2>/dev/null >> "$RUN_DIR/block_counts_tmp.txt"
     done
     if [[ -f "$RUN_DIR/block_counts_tmp.txt" && -s "$RUN_DIR/block_counts_tmp.txt" ]]; then
         block_counts_per_fs=$(cat "$RUN_DIR/block_counts_tmp.txt")
@@ -754,10 +726,11 @@ for k in "${K_VALUES[@]}"; do
     > "$RUN_DIR/fs_used_mb_tmp.txt"
     for NODE in "${DATANODE_NODES[@]}"; do
         # Get used space (in MB) for each loopback filesystem mount point
-        ssh "$NODE" "for i in {1..$k}; do
-            used=\$(df --output=used -BM \"${MOUNT_BASE}/dn\$i\" 2>/dev/null | tail -1 | tr -dc '0-9')
-            echo -n \"\${used:-0};\"
-        done" 2>/dev/null >> "$RUN_DIR/fs_used_mb_tmp.txt"
+        # Using df --output=used -BM to get used space in MB
+        ssh "$NODE" 'for i in {1..'"$k"'}; do
+            used=$(df --output=used -BM "/scratch/hdfs_loop/dn$i" 2>/dev/null | tail -1 | tr -dc "0-9")
+            echo -n "${used:-0};"
+        done' 2>/dev/null >> "$RUN_DIR/fs_used_mb_tmp.txt"
     done
     if [[ -f "$RUN_DIR/fs_used_mb_tmp.txt" && -s "$RUN_DIR/fs_used_mb_tmp.txt" ]]; then
         fs_used_mb_per_fs=$(cat "$RUN_DIR/fs_used_mb_tmp.txt")
@@ -799,7 +772,7 @@ for k in "${K_VALUES[@]}"; do
         scp -q "$SCRIPT_DIR/count-input-blocks-per-fs.sh" "$NODE:/tmp/count-input-blocks-per-fs.sh" 2>/dev/null || true
 
         # Run helper script on remote node - pass block IDs file instead of HDFS path
-        NODE_OUTPUT=$(ssh "$NODE" "bash /tmp/count-input-blocks-per-fs.sh /tmp/input_block_ids_k${k}.txt $k ${MOUNT_BASE}" 2>/dev/null || echo "")
+        NODE_OUTPUT=$(ssh "$NODE" "bash /tmp/count-input-blocks-per-fs.sh /tmp/input_block_ids_k${k}.txt $k /scratch/hdfs_loop" 2>/dev/null || echo "")
         if [[ -n "$NODE_OUTPUT" ]]; then
             echo -n "${NODE_OUTPUT};" >> "$RUN_DIR/input_block_counts_tmp.txt"
         fi
@@ -920,13 +893,14 @@ log "============================================================"
 log "Restoring normal single-DataNode cluster..."
 log "============================================================"
 
-unset HADOOP_CONF_DIR
+printf "%s\n" "${WORKER_NODES[@]}" > "$CONFIG_DIR/workers"
+export HADOOP_CONF_DIR="$CONFIG_DIR"
 
-rm -rf "${HADOOP_DATA_DIR}/namenode/current" 2>/dev/null || true
-rm -rf "${HADOOP_DATA_DIR}/datanode/current" 2>/dev/null || true
+rm -rf /scratch/hadoop_data/namenode/current 2>/dev/null || true
+rm -rf /scratch/hadoop_data/datanode/current 2>/dev/null || true
 for node in "${ALL_NODES[@]}"; do
     if [[ "$node" != "$(hostname)" && "$node" != "$MASTER_NODE" ]]; then
-        ssh "$node" "rm -rf ${HADOOP_DATA_DIR}/datanode/current" 2>/dev/null || true
+        ssh "$node" "rm -rf /scratch/hadoop_data/datanode/current" 2>/dev/null || true
     fi
 done
 
