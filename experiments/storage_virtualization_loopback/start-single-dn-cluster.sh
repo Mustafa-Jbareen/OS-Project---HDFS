@@ -27,15 +27,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# cluster.conf provides MASTER_NODE, ALL_NODES, WORKER_NODES,
+# HADOOP_HOME, HADOOP_DATA_DIR, CONFIG_DIR, IMAGE_DIR, MOUNT_BASE.
+source "$SCRIPT_DIR/cluster.conf"
+
 K=${1:?Usage: start-single-dn-cluster.sh <k> [image_size_mb] [dn_heap_mb] [replication]}
 IMAGE_SIZE_MB=${2:-30720}
 DN_HEAP_MB=${3:-5500}
 REPLICATION=${4:-3}
 
-# Cluster nodes (CloudLab ARM m400)
-MASTER_NODE="ms0628.utah.cloudlab.us"
-ALL_NODES=("ms0628.utah.cloudlab.us" "ms0631.utah.cloudlab.us" "ms0615.utah.cloudlab.us" "ms0617.utah.cloudlab.us" "ms0610.utah.cloudlab.us")
-WORKER_NODES=("ms0631.utah.cloudlab.us" "ms0615.utah.cloudlab.us" "ms0617.utah.cloudlab.us" "ms0610.utah.cloudlab.us")
 MASTER_HAS_DN=${MASTER_HAS_DN:-0}
 
 DATANODE_NODES=()
@@ -49,12 +49,6 @@ if [[ "$MASTER_HAS_DN" == "0" ]]; then
     echo "Master is configured as NameNode-only (no DataNode on $MASTER_NODE)."
 fi
 
-# Paths
-HADOOP_HOME="/scratch/hadoop/hadoop-3.3.1"
-HADOOP_DATA_DIR="/scratch/hadoop_data"
-CONFIG_DIR="/scratch/tmp/hadoop_single_dn_k_dirs"
-IMAGE_DIR="/scratch/loop_images"
-MOUNT_BASE="/scratch/hdfs_loop"
 NAMENODE_PORT=9000
 
 EXPECTED_DATANODES=${#DATANODE_NODES[@]}

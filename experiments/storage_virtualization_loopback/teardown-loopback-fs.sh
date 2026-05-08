@@ -5,7 +5,7 @@
 #              setup-loopback-fs.sh.
 #
 # USAGE: bash teardown-loopback-fs.sh [max_k] [image_dir] [mount_base]
-#   max_k      - Maximum k to clean up (default: 512)
+#   max_k      - Maximum k to clean up (default: 1024)
 #   image_dir  - Directory where .img files are stored (default: /scratch/loop_images)
 #   mount_base - Base mount point (default: /scratch/hdfs_loop)
 #
@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-MAX_K=${1:-512}
+MAX_K=${1:-1024}
 IMAGE_DIR=${2:-/scratch/loop_images}
 MOUNT_BASE=${3:-/scratch/hdfs_loop}
 

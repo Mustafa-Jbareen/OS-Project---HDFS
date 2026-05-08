@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la \"c:/Users/ROG STRIX/OneDrive/سطح المكتب/Technion CS Courses/Dan/hadoop/storage_virtualization_loopback/run_2026-04-18_19-21-56\" 2>/dev/null)",
+      "Read(//c/Users/ROG STRIX/OneDrive/سطح المكتب/Technion CS Courses/Dan/hadoop/storage_virtualization_loopback/run_2026-04-18_19-21-56/**)",
+      "Bash(ls -la \"c:/Users/ROG STRIX/OneDrive/سطح المكتب/Technion CS Courses/Dan/hadoop/storage_virtualization_cloudlab_results/\" 2>/dev/null)",
+      "Read(//c/Users/ROG STRIX/OneDrive/سطح المكتب/Technion CS Courses/Dan/hadoop/storage_virtualization_cloudlab_results/**)"
+    ]
+  }
+}

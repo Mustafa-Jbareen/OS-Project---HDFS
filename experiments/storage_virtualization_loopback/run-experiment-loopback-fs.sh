@@ -21,6 +21,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR/../.."
 WORDCOUNT_DIR="$SCRIPT_DIR/../wordcount"
 
+# cluster.conf defines: MASTER_NODE, ALL_NODES, WORKER_NODES,
+# STORAGE_BASE, HADOOP_HOME, IMAGE_DIR, MOUNT_BASE, HADOOP_DATA_DIR,
+# TMP_BASE, CONFIG_DIR.
+source "$SCRIPT_DIR/cluster.conf"
+
 RESULTS_BASE="${RESULTS_BASE:-$PROJECT_ROOT/results/storage_virtualization_loopback}"
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 RUN_DIR="$RESULTS_BASE/run_$TIMESTAMP"
@@ -29,28 +34,29 @@ mkdir -p "$RUN_DIR"
 # ============================================================================
 # PARAMETERS
 # ============================================================================
-K_REPS=${1:-5}  # Number of repetitions per k value
+K_REPS=${1:-3}  # Number of repetitions per k value
 
-INPUT_SIZE_GB=1   # 50GB input (using /scratch with 236GB available)
-BLOCK_SIZE=$((32 * 1024 * 1024))    # 32MB in bytes (must match dfs.blocksize in generate-single-dn-configs.sh)
+# c6620 bring-up profile: 1GB input, just k=1 vs k=512 to verify plumbing.
+# Bump INPUT_SIZE_GB back to 50 (and widen K_VALUES) once verified.
+INPUT_SIZE_GB=${INPUT_SIZE_GB:-1}
+BLOCK_SIZE=$((32 * 1024 * 1024))    # 32MB; matches HDD baseline
 BLOCK_SIZE_HUMAN="32MB"
 REPLICATION=3                       # Standard HDFS replication
 
-# k values to test: number of loopback storage dirs per DataNode (doubling progression)
-K_VALUES=(1 2 4 8 16 32 64 128 256 512)
+# k values to test (just two for c6620 bring-up)
+K_VALUES=(1 512)
 
 # Loopback sizing policy
 LOOPBACK_BUDGET_PER_NODE_GB=80
 MIN_IMAGE_SIZE_MB=100  # Minimum image size is 100MB
 
-# Cluster info (CloudLab ARM m400)
-REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# WordCount mode:
+#   real    -> stock hadoop-mapreduce-examples wordcount (full CPU work)
+#   trivial -> custom no-tokenization mapper, isolates I/O+framework cost
+WORDCOUNT_MODE=${WORDCOUNT_MODE:-real}
+TRIVIAL_WC_JAR="${TRIVIAL_WC_JAR:-$WORDCOUNT_DIR/trivial/trivial-wordcount.jar}"
 
-MASTER_NODE="ms0628.utah.cloudlab.us"
-ALL_NODES=("ms0628.utah.cloudlab.us" "ms0631.utah.cloudlab.us" "ms0615.utah.cloudlab.us" "ms0617.utah.cloudlab.us" "ms0610.utah.cloudlab.us")
-WORKER_NODES=("ms0631.utah.cloudlab.us" "ms0615.utah.cloudlab.us" "ms0617.utah.cloudlab.us" "ms0610.utah.cloudlab.us")
 MASTER_HAS_DN=${MASTER_HAS_DN:-0}
-
 DATANODE_NODES=()
 if [[ "$MASTER_HAS_DN" == "0" ]]; then
     DATANODE_NODES=("${WORKER_NODES[@]}")
@@ -59,11 +65,7 @@ else
 fi
 
 NUM_PHYSICAL_NODES=${#ALL_NODES[@]}
-HADOOP_HOME="/scratch/hadoop/hadoop-3.3.1"
-
 NUM_DATANODE_HOSTS=${#DATANODE_NODES[@]}
-
-CONFIG_DIR="/scratch/tmp/hadoop_single_dn_k_dirs"
 
 # NameNode JMX endpoint for memory monitoring
 NAMENODE_HOST="$MASTER_NODE"
@@ -199,75 +201,38 @@ start_iostat_monitor() {
     for node in "${DATANODE_NODES[@]}"; do
         local outfile="$IOSTAT_DIR/iostat_k${k}_${node}.log"
 
-                # Detect the block device backing /scratch (handles nvme, dm, and partitions).
+                # Detect the physical block device backing $STORAGE_BASE
+                # (handles LVM-on-NVMe -> /dev/mapper/X -> dm-N -> nvme0n1,
+                # plain partitions like sda1 -> sda, nvme0n1p3 -> nvme0n1).
+                # Strategy: findmnt -> lsblk -snro NAME walks the dependency
+                # tree down to the physical device.
                 local scratch_dev
-                scratch_dev=$(ssh "$node" bash -s << 'DEVEOF'
-set +e  # Don't exit on error; we have fallbacks
+                scratch_dev=$(ssh "$node" "STORAGE_BASE='$STORAGE_BASE' bash -s" << 'DEVEOF'
+set +e
+mp="${STORAGE_BASE:-/scratch}"
 
-# Method 1: Try findmnt to get the source device
-src=$(findmnt -no SOURCE /scratch 2>/dev/null)
+# -T <path> finds the mount containing <path>; works when $mp is a symlink
+# (c6620 has /scratch -> /mydata).
+src=$(findmnt -T "$mp" -no SOURCE 2>/dev/null)
+[ -z "$src" ] && src=$(df "$mp" 2>/dev/null | awk 'NR==2{print $1}')
 
-# Method 2: If findmnt fails, try df
-if [[ -z "$src" ]]; then
-    src=$(df /scratch 2>/dev/null | awk 'NR==2{print $1}')
+# Walk down to the leaf physical device(s). For LVM/dm, lsblk -s with the
+# source device prints all underlying devices. The last NVMe / disk / SSD
+# is the physical one we want to monitor.
+phys=""
+if [ -n "$src" ]; then
+    phys=$(lsblk -snro NAME,TYPE "$src" 2>/dev/null \
+           | awk '$2=="disk"{print $1}' | head -1)
 fi
 
-# Method 3: Try to resolve to a real /dev/ path
-if [[ -n "$src" && "$src" != /* ]]; then
-    # If src is not a /dev/ path, try to find it via lsblk
-    resolved=$(lsblk -n -o NAME,MOUNTPOINT 2>/dev/null | grep "/scratch" | awk '{print $1}')
-    if [[ -n "$resolved" ]]; then
-        src="/dev/$resolved"
-    fi
-fi
-
-# Fallback to readlink to resolve symlinks/mountpoints
-if [[ -n "$src" ]]; then
-    src=$(readlink -f "$src" 2>/dev/null || echo "$src")
-fi
-
-# Method 4: Use lsblk to find any mounted device at /scratch
-if [[ -z "$src" ]] || [[ ! -b "$src" ]]; then
-    src=$(lsblk -rn -o NAME,MOUNTPOINT 2>/dev/null | awk '$2 == "/scratch" {print "/dev/" $1}' | head -1)
-fi
-
-base=""
-if [[ -n "$src" && -b "$src" ]]; then
-    # src is now a valid /dev/ path
-    base=$(basename "$src")
-    
-    # Remove partition suffix (e.g., "sda1" -> "sda", "nvme0n1p1" -> "nvme0n1")
-    if [[ "$base" =~ ^([a-z]+[0-9]*)p?[0-9]+$ ]]; then
-        base="${BASH_REMATCH[1]}"
-    fi
-    
-    # If it's a dm device, try to find the backing device
-    if [[ "$base" =~ ^dm- ]]; then
-        parent=$(lsblk -rn -o NAME,TYPE /dev/"$base" 2>/dev/null | grep -v "^$base" | head -1 | awk '{print $1}')
-        # If parent found, use it; else keep dm device
-        if [[ -n "$parent" ]]; then
-            if [[ "$parent" =~ ^([a-z]+[0-9]*)p?[0-9]*$ ]]; then
-                base="${BASH_REMATCH[1]}"
-            else
-                base="$parent"
-            fi
-        fi
-    fi
-fi
-
-# Final fallback: if device is still empty or not valid, use sda
-if [[ -z "$base" ]]; then
-    # Last resort: check if any of these common devices exist
-    for candidate in sda nvme0n1 vda; do
-        if [[ -b /dev/$candidate ]]; then
-            base="$candidate"
-            break
-        fi
+# Fallbacks: common physical device names
+if [ -z "$phys" ]; then
+    for c in nvme0n1 sda vda; do
+        if [ -b "/dev/$c" ]; then phys=$c; break; fi
     done
-    [[ -z "$base" ]] && base="sda"  # Ultimate fallback
 fi
-
-echo "$base"
+[ -z "$phys" ] && phys=sda
+echo "$phys"
 DEVEOF
                 )
                 
@@ -276,10 +241,10 @@ DEVEOF
                     log "  WARNING: device detection failed on $node, using fallback sda"
                     scratch_dev="sda"
                 else
-                    log "  Device detection: /scratch backed by $scratch_dev"
+                    log "  Device detection: $STORAGE_BASE backed by $scratch_dev"
                 fi
 
-                log "  iostat on $node: monitoring device=${scratch_dev} (/scratch)"
+                log "  iostat on $node: monitoring device=${scratch_dev} ($STORAGE_BASE)"
                 # LANG=C fixes timestamp format. -k forces KB/s units; -y skips the boot-time report.
                 # stdbuf ensures output is flushed even if the SSH session is stopped.
                 ssh "$node" "LANG=C stdbuf -oL -eL iostat -dxkty 5 ${scratch_dev}" > "$outfile" 2>/dev/null &
@@ -546,7 +511,9 @@ echo "Run ID:           $TIMESTAMP"
 echo "Input size:       ${INPUT_SIZE_GB}GB"
 echo "Block size:       $BLOCK_SIZE_HUMAN"
 echo "Replication:      $REPLICATION"
+echo "WordCount mode:   $WORDCOUNT_MODE"
 echo "Master has DN:    $MASTER_HAS_DN"
+echo "Storage base:     $STORAGE_BASE  (HADOOP_HOME=$HADOOP_HOME)"
 echo "Loopback budget:  ${LOOPBACK_BUDGET_PER_NODE_GB}GB/node (min ${MIN_IMAGE_SIZE_MB}MB/image)"
 echo "Physical nodes:   $NUM_PHYSICAL_NODES (${ALL_NODES[*]})"
 echo "DataNode hosts:   $NUM_DATANODE_HOSTS (${DATANODE_NODES[*]})"
@@ -572,6 +539,7 @@ echo ""
 export LOOPBACK_BUDGET_PER_NODE_GB MIN_IMAGE_SIZE_MB K_REPS
 export TIMESTAMP INPUT_SIZE_GB BLOCK_SIZE BLOCK_SIZE_HUMAN REPLICATION
 export NUM_PHYSICAL_NODES RUN_DIR NUM_DATANODE_HOSTS MASTER_HAS_DN
+export WORDCOUNT_MODE STORAGE_BASE
 
 K_VALUES_CSV=$(IFS=,; echo "${K_VALUES[*]}")
 NODE_NAMES_CSV=$(IFS=,; echo "${ALL_NODES[*]}")
@@ -605,6 +573,8 @@ meta = {
     "loopback_budget_per_node_gb": int(os.environ["LOOPBACK_BUDGET_PER_NODE_GB"]),
     "min_image_size_mb": int(os.environ["MIN_IMAGE_SIZE_MB"]),
     "repetitions": int(os.environ["K_REPS"]),
+    "wordcount_mode": os.environ.get("WORDCOUNT_MODE", "real"),
+    "storage_base": os.environ.get("STORAGE_BASE", "/scratch"),
     "start_time": datetime.now().astimezone().isoformat(timespec="seconds"),
 }
 
@@ -654,6 +624,13 @@ for k in "${K_VALUES[@]}"; do
     NN_BLOCK_COUNT=$(echo "$NN_BEFORE" | awk '{print $3}')
     log "  NN heap before: ${NN_HEAP_BEFORE}MB, blocks: $NN_BLOCK_COUNT"
 
+    # -- Step 2.5: Fragmentation snapshot (mentor's filefrag check) --
+    # Captures extent counts of loopback images + sampled HDFS block files
+    # AFTER input is on disk, BEFORE any MapReduce work touches it.
+    log "Measuring fragmentation (filefrag) for k=$k..."
+    bash "$SCRIPT_DIR/measure-fragmentation.sh" "$k" "$RUN_DIR/fragmentation" "${DATANODE_NODES[@]}" 2>&1 | tee -a "$LOG_FILE" || \
+        log "  WARNING: fragmentation step failed for k=$k (continuing)"
+
     # Monitor NameNode memory while WordCount runs
     NN_MONITOR_CSV="$NN_MEMORY_DIR/nn_memory_k${k}.csv"
     start_nn_monitor "$NN_MONITOR_CSV" 5
@@ -693,16 +670,28 @@ for k in "${K_VALUES[@]}"; do
         bash "$WORDCOUNT_DIR/generate-input.sh" "$((INPUT_SIZE_GB * 1024))" "$BLOCK_SIZE" 2>/dev/null || true
         sleep 2
 
-        # Time the WordCount job
+        # Time the WordCount job (real or trivial depending on $WORDCOUNT_MODE)
         START_TIME=$(date +%s.%N)
         WC_START_EPOCH=$(date +%s)
 
-        hadoop jar "$HADOOP_HOME/share/hadoop/mapreduce/hadoop-mapreduce-examples-"*.jar \
-            wordcount \
-            -D mapreduce.jobhistory.address=${MASTER_NODE}:10020 \
-            -D mapreduce.jobhistory.webapp.address=${MASTER_NODE}:19888 \
-            /user/$USER/wordcount/input \
-            /user/$USER/wordcount/output 2>&1 | tee -a "$LOG_FILE"
+        if [[ "$WORDCOUNT_MODE" == "trivial" ]]; then
+            if [[ ! -f "$TRIVIAL_WC_JAR" ]]; then
+                log "  ERROR: WORDCOUNT_MODE=trivial but jar missing: $TRIVIAL_WC_JAR"
+                exit 1
+            fi
+            hadoop jar "$TRIVIAL_WC_JAR" TrivialWordCount \
+                -D mapreduce.jobhistory.address=${MASTER_NODE}:10020 \
+                -D mapreduce.jobhistory.webapp.address=${MASTER_NODE}:19888 \
+                /user/$USER/wordcount/input \
+                /user/$USER/wordcount/output 2>&1 | tee -a "$LOG_FILE"
+        else
+            hadoop jar "$HADOOP_HOME/share/hadoop/mapreduce/hadoop-mapreduce-examples-"*.jar \
+                wordcount \
+                -D mapreduce.jobhistory.address=${MASTER_NODE}:10020 \
+                -D mapreduce.jobhistory.webapp.address=${MASTER_NODE}:19888 \
+                /user/$USER/wordcount/input \
+                /user/$USER/wordcount/output 2>&1 | tee -a "$LOG_FILE"
+        fi
 
         WC_END_EPOCH=$(date +%s)
         END_TIME=$(date +%s.%N)
@@ -748,8 +737,8 @@ for k in "${K_VALUES[@]}"; do
     > "$RUN_DIR/block_counts_tmp.txt"
     for NODE in "${DATANODE_NODES[@]}"; do
         # Count block DATA files only (exclude .meta checksum files; each block has both)
-        # Path: /scratch/hdfs_loop/dn<i>/hdfs_data/current/BP-<pool-id>/current/.../blk_*
-        ssh "$NODE" 'for i in {1..'"$k"'}; do cnt=$(find /scratch/hdfs_loop/dn"$i"/hdfs_data -name "blk_*" -not -name "*.meta" -type f 2>/dev/null | wc -l); echo -n "$cnt;"; done' 2>/dev/null >> "$RUN_DIR/block_counts_tmp.txt"
+        # Path: ${MOUNT_BASE}/dn<i>/hdfs_data/current/BP-<pool-id>/current/.../blk_*
+        ssh "$NODE" "for i in {1..$k}; do cnt=\$(find ${MOUNT_BASE}/dn\$i/hdfs_data -name 'blk_*' -not -name '*.meta' -type f 2>/dev/null | wc -l); echo -n \"\$cnt;\"; done" 2>/dev/null >> "$RUN_DIR/block_counts_tmp.txt"
     done
     if [[ -f "$RUN_DIR/block_counts_tmp.txt" && -s "$RUN_DIR/block_counts_tmp.txt" ]]; then
         block_counts_per_fs=$(cat "$RUN_DIR/block_counts_tmp.txt")
@@ -765,11 +754,10 @@ for k in "${K_VALUES[@]}"; do
     > "$RUN_DIR/fs_used_mb_tmp.txt"
     for NODE in "${DATANODE_NODES[@]}"; do
         # Get used space (in MB) for each loopback filesystem mount point
-        # Using df --output=used -BM to get used space in MB
-        ssh "$NODE" 'for i in {1..'"$k"'}; do
-            used=$(df --output=used -BM "/scratch/hdfs_loop/dn$i" 2>/dev/null | tail -1 | tr -dc "0-9")
-            echo -n "${used:-0};"
-        done' 2>/dev/null >> "$RUN_DIR/fs_used_mb_tmp.txt"
+        ssh "$NODE" "for i in {1..$k}; do
+            used=\$(df --output=used -BM \"${MOUNT_BASE}/dn\$i\" 2>/dev/null | tail -1 | tr -dc '0-9')
+            echo -n \"\${used:-0};\"
+        done" 2>/dev/null >> "$RUN_DIR/fs_used_mb_tmp.txt"
     done
     if [[ -f "$RUN_DIR/fs_used_mb_tmp.txt" && -s "$RUN_DIR/fs_used_mb_tmp.txt" ]]; then
         fs_used_mb_per_fs=$(cat "$RUN_DIR/fs_used_mb_tmp.txt")
@@ -811,7 +799,7 @@ for k in "${K_VALUES[@]}"; do
         scp -q "$SCRIPT_DIR/count-input-blocks-per-fs.sh" "$NODE:/tmp/count-input-blocks-per-fs.sh" 2>/dev/null || true
 
         # Run helper script on remote node - pass block IDs file instead of HDFS path
-        NODE_OUTPUT=$(ssh "$NODE" "bash /tmp/count-input-blocks-per-fs.sh /tmp/input_block_ids_k${k}.txt $k /scratch/hdfs_loop" 2>/dev/null || echo "")
+        NODE_OUTPUT=$(ssh "$NODE" "bash /tmp/count-input-blocks-per-fs.sh /tmp/input_block_ids_k${k}.txt $k ${MOUNT_BASE}" 2>/dev/null || echo "")
         if [[ -n "$NODE_OUTPUT" ]]; then
             echo -n "${NODE_OUTPUT};" >> "$RUN_DIR/input_block_counts_tmp.txt"
         fi
@@ -934,11 +922,11 @@ log "============================================================"
 
 unset HADOOP_CONF_DIR
 
-rm -rf /scratch/hadoop_data/namenode/current 2>/dev/null || true
-rm -rf /scratch/hadoop_data/datanode/current 2>/dev/null || true
+rm -rf "${HADOOP_DATA_DIR}/namenode/current" 2>/dev/null || true
+rm -rf "${HADOOP_DATA_DIR}/datanode/current" 2>/dev/null || true
 for node in "${ALL_NODES[@]}"; do
     if [[ "$node" != "$(hostname)" && "$node" != "$MASTER_NODE" ]]; then
-        ssh "$node" "rm -rf /scratch/hadoop_data/datanode/current" 2>/dev/null || true
+        ssh "$node" "rm -rf ${HADOOP_DATA_DIR}/datanode/current" 2>/dev/null || true
     fi
 done
 

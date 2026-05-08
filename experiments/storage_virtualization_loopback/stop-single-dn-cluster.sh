@@ -11,13 +11,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/cluster.conf"
 
 MAX_K=${1:-512}
 
-# Cluster nodes
-MASTER_NODE="ms0628.utah.cloudlab.us"
-ALL_NODES=("ms0628.utah.cloudlab.us" "ms0631.utah.cloudlab.us" "ms0615.utah.cloudlab.us" "ms0617.utah.cloudlab.us" "ms0610.utah.cloudlab.us")
-WORKER_NODES=("ms0631.utah.cloudlab.us" "ms0615.utah.cloudlab.us" "ms0617.utah.cloudlab.us" "ms0610.utah.cloudlab.us")
 MASTER_HAS_DN=${MASTER_HAS_DN:-0}
 
 DATANODE_NODES=()
@@ -26,9 +23,6 @@ if [[ "$MASTER_HAS_DN" == "0" ]]; then
 else
     DATANODE_NODES=("${ALL_NODES[@]}")
 fi
-
-IMAGE_DIR="/scratch/loop_images"
-MOUNT_BASE="/scratch/hdfs_loop"
 
 echo "============================================================"
 echo "Stopping Single DataNode Cluster"
