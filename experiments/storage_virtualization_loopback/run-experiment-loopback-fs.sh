@@ -38,16 +38,16 @@ K_REPS=${1:-3}  # Number of repetitions per k value
 
 # c6620 bring-up profile: 1GB input, just k=1 vs k=512 to verify plumbing.
 # Bump INPUT_SIZE_GB back to 50 (and widen K_VALUES) once verified.
-INPUT_SIZE_GB=${INPUT_SIZE_GB:-1}
+INPUT_SIZE_GB=${INPUT_SIZE_GB:-50}
 BLOCK_SIZE=$((32 * 1024 * 1024))    # 32MB; matches HDD baseline
 BLOCK_SIZE_HUMAN="32MB"
 REPLICATION=3                       # Standard HDFS replication
 
 # k values to test (just two for c6620 bring-up)
-K_VALUES=(1 512)
+K_VALUES=(1 128 512 1024)
 
 # Loopback sizing policy
-LOOPBACK_BUDGET_PER_NODE_GB=80
+LOOPBACK_BUDGET_PER_NODE_GB=200
 MIN_IMAGE_SIZE_MB=100  # Minimum image size is 100MB
 
 # WordCount mode:

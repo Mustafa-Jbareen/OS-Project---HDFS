@@ -250,7 +250,7 @@ def plot_input_blocks_per_fs(results, metadata, output_dir: Path):
             box_labels.append(f"k={r['k']}\n({len(counts)} FSes)")
 
     if box_data:
-        bp = ax.boxplot(box_data, tick_labels=box_labels, patch_artist=True)
+        bp = ax.boxplot(box_data, labels=box_labels, patch_artist=True)
         colors = plt.colormaps["viridis"](np.linspace(0.2, 0.8, len(box_data)))
         for patch, color in zip(bp["boxes"], colors):
             patch.set_facecolor(color)
