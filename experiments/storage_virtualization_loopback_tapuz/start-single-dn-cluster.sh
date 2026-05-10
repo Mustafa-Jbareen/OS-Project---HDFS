@@ -33,7 +33,7 @@ source "$SCRIPT_DIR/cluster.conf"
 
 K=${1:?Usage: start-single-dn-cluster.sh <k> [image_size_mb] [dn_heap_mb] [replication]}
 IMAGE_SIZE_MB=${2:-30720}
-DN_HEAP_MB=${3:-5500}
+DN_HEAP_MB=${3:-auto}   # "auto" = generate-single-dn-configs.sh sizes from local RAM
 REPLICATION=${4:-3}
 
 MASTER_HAS_DN=${MASTER_HAS_DN:-0}
@@ -334,7 +334,12 @@ done
 # ============================================================================
 echo ""
 echo "=== STEP 7: Starting YARN ==="
-unset HADOOP_CONF_DIR
+# Keep HADOOP_CONF_DIR pointing at the auto-generated $CONFIG_DIR so start-yarn.sh
+# reads the yarn-site.xml that has yarn.resourcemanager.hostname=$MASTER_NODE
+# and the workers list. Unsetting it makes start-yarn.sh fall back to
+# $HADOOP_HOME/etc/hadoop, which may reference stale hostnames -- ResourceManager
+# then never binds to the right address and clients get "Connection refused" on :8032.
+export HADOOP_CONF_DIR="$CONFIG_DIR"
 start-yarn.sh 2>/dev/null || true
 mapred --daemon start historyserver 2>/dev/null || true
 

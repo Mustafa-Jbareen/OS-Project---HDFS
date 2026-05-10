@@ -62,7 +62,9 @@ for ((i=1; i<=k; i++)); do
     [ -f "$img" ] || continue
     size=$(stat -c%s "$img" 2>/dev/null || echo 0)
     # filefrag prints "<path>: N extents found"
-    ext=$(sudo filefrag "$img" 2>/dev/null | grep -oP '\d+(?= extents? found)' || echo "")
+    # No sudo: setup-loopback-fs.sh chmods images 644 so filefrag works as the user.
+    # (Tapuz NOPASSWD list doesn't include filefrag; sudo here would prompt and hang.)
+    ext=$(filefrag "$img" 2>/dev/null | grep -oP '\d+(?= extents? found)' || echo "")
     [ -z "$ext" ] && ext=0
     echo "IMG;$i;$img;$size;$ext"
 done
@@ -75,7 +77,8 @@ for ((i=1; i<=k; i++)); do
     while IFS= read -r blk; do
         [ -z "$blk" ] && continue
         size=$(stat -c%s "$blk" 2>/dev/null || echo 0)
-        ext=$(sudo filefrag "$blk" 2>/dev/null | grep -oP '\d+(?= extents? found)' || echo "")
+        # HDFS block files are owned by $USER (Hadoop runs as user), no sudo needed.
+        ext=$(filefrag "$blk" 2>/dev/null | grep -oP '\d+(?= extents? found)' || echo "")
         [ -z "$ext" ] && ext=0
         echo "BLK;$i;$blk;$size;$ext"
     done < <(find "$fs_root" -type f -name 'blk_*' ! -name '*.meta' 2>/dev/null | head -n "$max_blocks")

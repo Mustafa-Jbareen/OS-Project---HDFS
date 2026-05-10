@@ -1,12 +1,13 @@
 #!/bin/bash
 ################################################################################
 # SCRIPT: bootstrap-tapuz.sh
-# DESCRIPTION: One-time setup for the tapuz HDD cluster.
-#              - Verifies /scratch is writable on every node
+# DESCRIPTION: One-time pre-flight for the tapuz HDD cluster.
+#              - Verifies /scratch exists and we can sudo mkdir/chmod inside it
 #              - Verifies passwordless SSH between nodes
 #              - Reports presence of iostat, filefrag, bc, java, hadoop
-#              - Does NOT auto-install packages (tapuzes are managed; ask the
-#                lab admin if anything is missing).
+#              - Verifies the specific NOPASSWD sudo commands the experiment
+#                uses (mkfs.ext4, mount, umount, fallocate, losetup, mkdir,
+#                chmod, rmdir, rm)
 #
 # RUN ON: master node (tapuz14). Will SSH to all peers.
 #
@@ -25,9 +26,13 @@ echo "  Nodes:   ${ALL_NODES[*]}"
 echo "  Storage: $STORAGE_BASE  (Hadoop: $HADOOP_HOME)"
 echo "============================================================"
 
-# ---- Step 1: verify /scratch is usable on every node ------------------------
+# ---- Step 1: verify $STORAGE_BASE exists and sudo mkdir/chmod work ---------
+# /scratch is root-owned on tapuzes. The experiment uses `sudo mkdir`/`sudo chmod`
+# (both NOPASSWD on tapuz) to create $IMAGE_DIR / $MOUNT_BASE / $HADOOP_DATA_DIR
+# at runtime, so we don't need /scratch itself to be user-writable. We only
+# verify the same sudo path the experiment will take actually works.
 echo ""
-echo "=== STEP 1: Checking $STORAGE_BASE is writable on each node ==="
+echo "=== STEP 1: Checking $STORAGE_BASE + sudo mkdir/chmod on each node ==="
 ALL_OK=1
 for node in "${ALL_NODES[@]}"; do
     echo "--- $node ---"
@@ -38,12 +43,17 @@ if [ ! -d "$mp" ]; then
     echo "  ERROR: $mp does not exist"
     exit 1
 fi
-testfile="$mp/.bootstrap_test_$$"
-if ! touch "$testfile" 2>/dev/null; then
-    echo "  ERROR: $mp not writable by $USER"
+testdir="$mp/.bootstrap_test_$$"
+if ! sudo -n /bin/mkdir -p "$testdir" 2>/dev/null; then
+    echo "  ERROR: sudo -n mkdir $testdir failed (passwordless sudo for /bin/mkdir not granted?)"
     exit 1
 fi
-rm -f "$testfile"
+if ! sudo -n /bin/chmod 777 "$testdir" 2>/dev/null; then
+    echo "  ERROR: sudo -n chmod 777 $testdir failed"
+    sudo -n /bin/rmdir "$testdir" 2>/dev/null || true
+    exit 1
+fi
+sudo -n /bin/rmdir "$testdir" 2>/dev/null || true
 df -h "$mp" | tail -1 | awk '{printf "  %s available on %s (mount %s, used %s)\n", $4, $1, $6, $5}'
 REMOTE
 done
@@ -61,9 +71,8 @@ for node in "${ALL_NODES[@]}"; do
     fi
 done
 if [[ "$SSH_OK" != "1" ]]; then
-    echo "  Fix SSH first. On tapuzes /home is NFS-shared, so adding"
-    echo "  ~/.ssh/id_*.pub to ~/.ssh/authorized_keys on tapuz14 should"
-    echo "  propagate to every node automatically."
+    echo "  Fix SSH first. NFS-shared \$HOME means adding pubkey to"
+    echo "  ~/.ssh/authorized_keys on tapuz14 propagates to every node."
 fi
 
 # ---- Step 3: report tooling presence ---------------------------------------
@@ -86,21 +95,41 @@ fi
 REMOTE
 done
 
-# ---- Step 4: sudo-without-password check (needed for loopback mounts) -------
+# ---- Step 4: passwordless-sudo coverage for the commands we actually use ---
 echo ""
-echo "=== STEP 4: Passwordless sudo check (needed for losetup/mount) ==="
+echo "=== STEP 4: Verifying NOPASSWD sudo for required commands ==="
+REQUIRED_CMDS=(/sbin/mkfs.ext4 /bin/mount /bin/umount /usr/bin/fallocate /sbin/losetup /bin/mkdir /bin/chmod /bin/rmdir /bin/rm)
 SUDO_OK=1
 for node in "${ALL_NODES[@]}"; do
-    if ssh "$node" "sudo -n true" >/dev/null 2>&1; then
-        echo "  $node: passwordless sudo ok"
-    else
-        echo "  $node: FAIL — sudo requires a password"
-        SUDO_OK=0
-    fi
+    echo "--- $node ---"
+    # Flatten multi-line NOPASSWD section into one comma-separated list,
+    # then split on commas so each command is its own token. Exact-match
+    # against REQUIRED_CMDS avoids false positives like /bin/rm matching /bin/rmdir.
+    rules=$(ssh "$node" "sudo -n -l 2>/dev/null" || echo "")
+    nopasswd_line=$(echo "$rules" | tr '\n' ' ' | grep -oE 'NOPASSWD:[^()]*' | head -1 || echo "")
+    declare -a granted=()
+    IFS=',' read -ra parts <<<"${nopasswd_line#NOPASSWD:}"
+    for part in "${parts[@]}"; do
+        # Trim whitespace; take the executable path only (drop any args)
+        trimmed=$(echo "$part" | awk '{print $1}')
+        [[ -n "$trimmed" ]] && granted+=("$trimmed")
+    done
+    for cmd in "${REQUIRED_CMDS[@]}"; do
+        found=0
+        for g in "${granted[@]}"; do
+            [[ "$g" == "$cmd" ]] && { found=1; break; }
+        done
+        if (( found )); then
+            echo "  $cmd: ok"
+        else
+            echo "  $cmd: MISSING (not in NOPASSWD list)"
+            SUDO_OK=0
+        fi
+    done
+    unset granted
 done
 if [[ "$SUDO_OK" != "1" ]]; then
-    echo "  Loopback FS setup uses sudo losetup/mount/mkfs. Without"
-    echo "  passwordless sudo the start-/stop-cluster scripts will hang."
+    echo "  Ask the lab admin for: NOPASSWD: ${REQUIRED_CMDS[*]}"
 fi
 
 echo ""

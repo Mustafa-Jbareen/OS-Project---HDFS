@@ -36,18 +36,20 @@ mkdir -p "$RUN_DIR"
 # ============================================================================
 K_REPS=${1:-3}  # Number of repetitions per k value
 
-# c6620 bring-up profile: 1GB input, just k=1 vs k=512 to verify plumbing.
-# Bump INPUT_SIZE_GB back to 50 (and widen K_VALUES) once verified.
-INPUT_SIZE_GB=${INPUT_SIZE_GB:-50}
-BLOCK_SIZE=$((32 * 1024 * 1024))    # 32MB; matches HDD baseline
+# Cache-warm-vs-cold ablation profile:
+#   30GB input fits in c6620's 128GB RAM, so when DROP_CACHES=0 the second and
+#   third reps read entirely from page cache. 32MB blocks match the historical
+#   m400 baseline (more per-block framework work per byte). k spans 4096x.
+INPUT_SIZE_GB=${INPUT_SIZE_GB:-1}
+BLOCK_SIZE=$((32 * 1024 * 1024))    # 32MB
 BLOCK_SIZE_HUMAN="32MB"
 REPLICATION=3                       # Standard HDFS replication
 
-# k values to test (just two for c6620 bring-up)
-K_VALUES=(1 128 512 1024)
+# k values to test
+K_VALUES=(1 512 1024)
 
 # Loopback sizing policy
-LOOPBACK_BUDGET_PER_NODE_GB=200
+LOOPBACK_BUDGET_PER_NODE_GB=80
 MIN_IMAGE_SIZE_MB=100  # Minimum image size is 100MB
 
 # WordCount mode:
@@ -55,6 +57,13 @@ MIN_IMAGE_SIZE_MB=100  # Minimum image size is 100MB
 #   trivial -> custom no-tokenization mapper, isolates I/O+framework cost
 WORDCOUNT_MODE=${WORDCOUNT_MODE:-real}
 TRIVIAL_WC_JAR="${TRIVIAL_WC_JAR:-$WORDCOUNT_DIR/trivial/trivial-wordcount.jar}"
+
+# Cache-flush toggle:
+#   1 (default) -> drop_caches between reps; WC reads come from disk
+#   0           -> skip flush; data stays in page cache after upload
+# Set DROP_CACHES=0 on the command line to reproduce the original
+# "cache-warm" condition that exposed framework overhead at high k.
+DROP_CACHES=0   # hardcoded: match best_2/tapuz (no cache drops between reps)
 
 MASTER_HAS_DN=${MASTER_HAS_DN:-0}
 DATANODE_NODES=()
@@ -512,6 +521,7 @@ echo "Input size:       ${INPUT_SIZE_GB}GB"
 echo "Block size:       $BLOCK_SIZE_HUMAN"
 echo "Replication:      $REPLICATION"
 echo "WordCount mode:   $WORDCOUNT_MODE"
+echo "Drop caches:      $DROP_CACHES  (1=cold reads, 0=cache-warm ablation)"
 echo "Master has DN:    $MASTER_HAS_DN"
 echo "Storage base:     $STORAGE_BASE  (HADOOP_HOME=$HADOOP_HOME)"
 echo "Loopback budget:  ${LOOPBACK_BUDGET_PER_NODE_GB}GB/node (min ${MIN_IMAGE_SIZE_MB}MB/image)"
@@ -539,7 +549,7 @@ echo ""
 export LOOPBACK_BUDGET_PER_NODE_GB MIN_IMAGE_SIZE_MB K_REPS
 export TIMESTAMP INPUT_SIZE_GB BLOCK_SIZE BLOCK_SIZE_HUMAN REPLICATION
 export NUM_PHYSICAL_NODES RUN_DIR NUM_DATANODE_HOSTS MASTER_HAS_DN
-export WORDCOUNT_MODE STORAGE_BASE
+export WORDCOUNT_MODE STORAGE_BASE DROP_CACHES
 
 K_VALUES_CSV=$(IFS=,; echo "${K_VALUES[*]}")
 NODE_NAMES_CSV=$(IFS=,; echo "${ALL_NODES[*]}")
@@ -575,6 +585,7 @@ meta = {
     "repetitions": int(os.environ["K_REPS"]),
     "wordcount_mode": os.environ.get("WORDCOUNT_MODE", "real"),
     "storage_base": os.environ.get("STORAGE_BASE", "/scratch"),
+    "drop_caches_between_reps": os.environ.get("DROP_CACHES", "1") == "1",
     "start_time": datetime.now().astimezone().isoformat(timespec="seconds"),
 }
 
@@ -601,6 +612,7 @@ for k in "${K_VALUES[@]}"; do
     # -- Step 1: Start the single-DN cluster with k storage dirs --
     log "Starting cluster with k=$k storage dirs per DataNode..."
     # Pass image size in MB to avoid integer truncation (200MB / 1024 = 0GB)
+    # DN heap "auto": generate-single-dn-configs.sh sizes it from each node's RAM.
     bash "$SCRIPT_DIR/start-single-dn-cluster.sh" "$k" "$IMAGE_SIZE_MB" "5500" "$REPLICATION" 2>&1 | tee -a "$LOG_FILE"
 
     # Record actual live DataNodes
@@ -648,24 +660,16 @@ for k in "${K_VALUES[@]}"; do
         log ""
         log "  Run $run_i/$K_REPS (k=$k)..."
 
-        # Remove output from previous run (outside the timed/measured window)
+        # Remove output from previous run
         hdfs dfs -rm -r -f /user/$USER/wordcount/output 2>/dev/null || true
 
-        # Flush HDFS caches and DataNode kernel caches to force disk reads (captures iostat)
-        log "  Flushing HDFS data and OS caches..."
-        
-        # 1. Clear HDFS read-ahead cache by dropping HDFS data
+        # Drop HDFS input and OS caches, then re-upload (cold reads every rep)
         hdfs dfs -rm -r -f /user/$USER/wordcount/input 2>/dev/null || true
-        
-        # 2. Flush and drop OS caches on all DataNodes
         for node in "${DATANODE_NODES[@]}"; do
             ssh "$node" "sudo sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'" 2>/dev/null || \
             ssh "$node" "sync && echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null || true
         done
         sleep 1
-        
-        # 3. Re-upload input data (will be fresh on disk, not in cache)
-        log "  Re-uploading input data..."
         hdfs dfs -mkdir -p /user/$USER/wordcount/input 2>/dev/null || true
         bash "$WORDCOUNT_DIR/generate-input.sh" "$((INPUT_SIZE_GB * 1024))" "$BLOCK_SIZE" 2>/dev/null || true
         sleep 2

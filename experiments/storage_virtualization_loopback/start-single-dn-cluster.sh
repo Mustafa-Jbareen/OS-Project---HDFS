@@ -33,7 +33,7 @@ source "$SCRIPT_DIR/cluster.conf"
 
 K=${1:?Usage: start-single-dn-cluster.sh <k> [image_size_mb] [dn_heap_mb] [replication]}
 IMAGE_SIZE_MB=${2:-30720}
-DN_HEAP_MB=${3:-5500}
+DN_HEAP_MB=${3:-auto}   # "auto" = generate-single-dn-configs.sh sizes from local RAM
 REPLICATION=${4:-3}
 
 MASTER_HAS_DN=${MASTER_HAS_DN:-0}
@@ -130,11 +130,17 @@ wait
 declare -A CONFIG_PIDS
 for node in "${ALL_NODES[@]}"; do
     echo "--- Starting config on $node ---"
+    # Forward optional YARN-cap env vars (empty -> auto). Quote so empty stays empty.
+    NM_MEM_CAP_MB="${NM_MEM_CAP_MB:-}"
+    NM_CORES_CAP="${NM_CORES_CAP:-}"
+    MR_CONTAINER_CAP_MB="${MR_CONTAINER_CAP_MB:-}"
     if [[ "$node" == "$(hostname)" || "$node" == "$MASTER_NODE" ]]; then
-        HADOOP_HOME=$HADOOP_HOME MASTER_NODE=$MASTER_NODE bash "$SCRIPT_DIR/generate-single-dn-configs.sh" "$K" "$CONFIG_DIR" "$MOUNT_BASE" "$DN_HEAP_MB" "$REPLICATION" > "/tmp/config_${node}.log" 2>&1 &
+        HADOOP_HOME=$HADOOP_HOME MASTER_NODE=$MASTER_NODE \
+            NM_MEM_CAP_MB="$NM_MEM_CAP_MB" NM_CORES_CAP="$NM_CORES_CAP" MR_CONTAINER_CAP_MB="$MR_CONTAINER_CAP_MB" \
+            bash "$SCRIPT_DIR/generate-single-dn-configs.sh" "$K" "$CONFIG_DIR" "$MOUNT_BASE" "$DN_HEAP_MB" "$REPLICATION" > "/tmp/config_${node}.log" 2>&1 &
         CONFIG_PIDS[$node]=$!
     else
-        ssh "$node" "HADOOP_HOME=$HADOOP_HOME MASTER_NODE=$MASTER_NODE bash /tmp/generate-single-dn-configs.sh $K $CONFIG_DIR $MOUNT_BASE $DN_HEAP_MB $REPLICATION" > "/tmp/config_${node}.log" 2>&1 &
+        ssh "$node" "HADOOP_HOME=$HADOOP_HOME MASTER_NODE=$MASTER_NODE NM_MEM_CAP_MB='$NM_MEM_CAP_MB' NM_CORES_CAP='$NM_CORES_CAP' MR_CONTAINER_CAP_MB='$MR_CONTAINER_CAP_MB' bash /tmp/generate-single-dn-configs.sh $K $CONFIG_DIR $MOUNT_BASE $DN_HEAP_MB $REPLICATION" > "/tmp/config_${node}.log" 2>&1 &
         CONFIG_PIDS[$node]=$!
     fi
 done
@@ -334,7 +340,12 @@ done
 # ============================================================================
 echo ""
 echo "=== STEP 7: Starting YARN ==="
-unset HADOOP_CONF_DIR
+# Keep HADOOP_CONF_DIR pointing at the auto-generated $CONFIG_DIR so start-yarn.sh
+# reads the yarn-site.xml that has yarn.resourcemanager.hostname=$MASTER_NODE
+# and the workers list. Unsetting it makes start-yarn.sh fall back to
+# $HADOOP_HOME/etc/hadoop, which may reference stale hostnames -- ResourceManager
+# then never binds to the right address and clients get "Connection refused" on :8032.
+export HADOOP_CONF_DIR="$CONFIG_DIR"
 start-yarn.sh 2>/dev/null || true
 mapred --daemon start historyserver 2>/dev/null || true
 

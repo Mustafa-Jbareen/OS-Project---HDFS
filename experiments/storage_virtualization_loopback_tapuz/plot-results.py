@@ -958,11 +958,14 @@ def plot_block_distribution(results, metadata, output_dir: Path):
         return
 
     num_dns = metadata.get("datanode_hosts", 4)
+    replication = metadata.get("replication", 3)
     k_vals = [r["k"] for r in valid]
-    total_blocks = [r["nn_block_count"] for r in valid]
+    # nn_block_count is logical blocks; each lives on disk in `replication` copies,
+    # so the cluster actually distributes nn_block_count * replication block files.
+    total_replicas = [r["nn_block_count"] * replication for r in valid]
     # total storage dirs in cluster = k * num_dns
     total_fses = [k * num_dns for k in k_vals]
-    mean_per_fs = [t / f for t, f in zip(total_blocks, total_fses)]
+    mean_per_fs = [t / f for t, f in zip(total_replicas, total_fses)]
 
     colors = _k_colors(len(valid))
     fig, ax = plt.subplots(figsize=(max(10, len(valid) * 1.1), 7))
@@ -971,11 +974,11 @@ def plot_block_distribution(results, metadata, output_dir: Path):
                   alpha=0.85, edgecolor="black", linewidth=0.5)
 
     max_val = max(mean_per_fs) if mean_per_fs else 1
-    for bar, mpf, total in zip(bars, mean_per_fs, total_blocks):
+    for bar, mpf, total in zip(bars, mean_per_fs, total_replicas):
         ax.text(
             bar.get_x() + bar.get_width() / 2,
             bar.get_height() + max_val * 0.03,
-            f"{mpf:.0f}\n({total} total)",
+            f"{mpf:.2f}\n({total} replicas)",
             ha="center", va="bottom", fontsize=9, fontweight="bold",
         )
 
