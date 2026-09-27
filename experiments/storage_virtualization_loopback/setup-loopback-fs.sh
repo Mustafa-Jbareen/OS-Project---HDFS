@@ -82,6 +82,10 @@ for ((i=1; i<=K; i++)); do
     echo "  Formatting as ext4..."
     sudo mkfs.ext4 -F -m0 -q "$IMG_FILE"
 
+    # Make the .img file world-readable so `filefrag` can run without sudo.
+    # Needed on tapuzes where filefrag is not in the NOPASSWD list.
+    sudo chmod 644 "$IMG_FILE"
+
     # Step 3: Create mount point and mount via loop driver
     sudo mkdir -p "$MOUNT_POINT"
     echo "  Mounting at $MOUNT_POINT..."

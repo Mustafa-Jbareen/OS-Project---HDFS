@@ -111,7 +111,7 @@ def plot_per_fs_block_distribution(results, metadata, output_dir: Path):
         x = 0
         for idx, r in enumerate(valid):
             counts = r["block_counts_per_fs"]
-            xs = list(range(x, x + len(counts)))
+            xs = [x + i for i in range(len(counts))]
             ax.bar(xs, counts, color=colors[idx], edgecolor="black", linewidth=0.4,
                    label=f"k={r['k']}")
             ax.text(np.mean(xs), max(counts) * 1.04, f"k={r['k']}",
@@ -250,7 +250,11 @@ def plot_input_blocks_per_fs(results, metadata, output_dir: Path):
             box_labels.append(f"k={r['k']}\n({len(counts)} FSes)")
 
     if box_data:
-        bp = ax.boxplot(box_data, labels=box_labels, patch_artist=True)
+        # Tick labels set separately: boxplot(labels=...) was renamed to
+        # tick_labels in matplotlib 3.9 and removed in 3.11.
+        bp = ax.boxplot(box_data, patch_artist=True)
+        ax.set_xticks(range(1, len(box_labels) + 1))
+        ax.set_xticklabels(box_labels)
         colors = plt.colormaps["viridis"](np.linspace(0.2, 0.8, len(box_data)))
         for patch, color in zip(bp["boxes"], colors):
             patch.set_facecolor(color)

@@ -10,14 +10,16 @@
 #   2. Generate single DataNode config with k storage dirs
 #   3. Format and start the NameNode
 #   4. Start one DataNode per node (using k loopback dirs)
-#   5. Start YARN ResourceManager + NodeManagers
+#   5. Start YARN ResourceManager + NodeManagers, verify the YARN capacity
 #   6. Wait for all DataNodes to register
 #
 # USAGE: bash start-single-dn-cluster.sh <k> [image_size_mb] [dn_heap_mb] [replication]
 #   k              - Number of loopback storage dirs per DataNode
 #   image_size_mb  - Size of each loopback image in MB (default: 30720 = 30GB)
-#   dn_heap_mb     - DataNode JVM heap in MB (default: 2048)
+#   dn_heap_mb     - DataNode JVM heap in MB or "auto" (default: DN_HEAP_MB from cluster conf)
 #   replication    - HDFS replication factor (default: 3)
+#
+# YARN pool per node: SLOTS_PER_NODE x CONTAINER_MB (cluster conf, env overrides).
 #
 # NOTE: Requires sudo on all nodes for loopback mount operations.
 ################################################################################
@@ -25,15 +27,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # cluster.conf provides MASTER_NODE, ALL_NODES, WORKER_NODES,
-# HADOOP_HOME, HADOOP_DATA_DIR, CONFIG_DIR, IMAGE_DIR, MOUNT_BASE.
+# HADOOP_HOME, HADOOP_DATA_DIR, CONFIG_DIR, IMAGE_DIR, MOUNT_BASE,
+# SLOTS_PER_NODE, CONTAINER_MB, DN_HEAP_MB.
 source "$SCRIPT_DIR/cluster.conf"
 
 K=${1:?Usage: start-single-dn-cluster.sh <k> [image_size_mb] [dn_heap_mb] [replication]}
 IMAGE_SIZE_MB=${2:-30720}
-DN_HEAP_MB=${3:-auto}   # "auto" = generate-single-dn-configs.sh sizes from local RAM
+DN_HEAP_MB=${3:-$DN_HEAP_MB}
 REPLICATION=${4:-3}
 
 MASTER_HAS_DN=${MASTER_HAS_DN:-0}
@@ -63,6 +65,7 @@ echo "  Expected DataNodes: $EXPECTED_DATANODES (1 per host)"
 echo "  Replication factor: $REPLICATION"
 echo "  Image size: ${IMAGE_SIZE_MB}MB per loopback FS"
 echo "  DN heap: ${DN_HEAP_MB}MB"
+echo "  YARN pool: ${SLOTS_PER_NODE} x ${CONTAINER_MB}MB per node"
 echo "============================================================"
 echo ""
 
@@ -126,34 +129,40 @@ for node in "${ALL_NODES[@]}"; do
 done
 wait
 
-# Run config generation in parallel
+# Run config generation in parallel. Every node gets the same YARN settings.
+GEN_ENV="HADOOP_HOME=$HADOOP_HOME MASTER_NODE=$MASTER_NODE SLOTS_PER_NODE=$SLOTS_PER_NODE CONTAINER_MB=$CONTAINER_MB"
 declare -A CONFIG_PIDS
 for node in "${ALL_NODES[@]}"; do
     echo "--- Starting config on $node ---"
-    # Forward optional YARN-cap env vars (empty -> auto). Quote so empty stays empty.
-    NM_MEM_CAP_MB="${NM_MEM_CAP_MB:-}"
-    NM_CORES_CAP="${NM_CORES_CAP:-}"
-    MR_CONTAINER_CAP_MB="${MR_CONTAINER_CAP_MB:-}"
     if [[ "$node" == "$(hostname)" || "$node" == "$MASTER_NODE" ]]; then
-        HADOOP_HOME=$HADOOP_HOME MASTER_NODE=$MASTER_NODE \
-            NM_MEM_CAP_MB="$NM_MEM_CAP_MB" NM_CORES_CAP="$NM_CORES_CAP" MR_CONTAINER_CAP_MB="$MR_CONTAINER_CAP_MB" \
-            bash "$SCRIPT_DIR/generate-single-dn-configs.sh" "$K" "$CONFIG_DIR" "$MOUNT_BASE" "$DN_HEAP_MB" "$REPLICATION" > "/tmp/config_${node}.log" 2>&1 &
+        # shellcheck disable=SC2086  # GEN_ENV is a list of VAR=value words
+        env $GEN_ENV bash "$SCRIPT_DIR/generate-single-dn-configs.sh" "$K" "$CONFIG_DIR" "$MOUNT_BASE" "$DN_HEAP_MB" "$REPLICATION" > "/tmp/config_${node}.log" 2>&1 &
         CONFIG_PIDS[$node]=$!
     else
-        ssh "$node" "HADOOP_HOME=$HADOOP_HOME MASTER_NODE=$MASTER_NODE NM_MEM_CAP_MB='$NM_MEM_CAP_MB' NM_CORES_CAP='$NM_CORES_CAP' MR_CONTAINER_CAP_MB='$MR_CONTAINER_CAP_MB' bash /tmp/generate-single-dn-configs.sh $K $CONFIG_DIR $MOUNT_BASE $DN_HEAP_MB $REPLICATION" > "/tmp/config_${node}.log" 2>&1 &
+        ssh "$node" "$GEN_ENV bash /tmp/generate-single-dn-configs.sh $K $CONFIG_DIR $MOUNT_BASE $DN_HEAP_MB $REPLICATION" > "/tmp/config_${node}.log" 2>&1 &
         CONFIG_PIDS[$node]=$!
     fi
 done
 
 # Wait for all config processes
+CONFIG_FAILED=0
 for node in "${ALL_NODES[@]}"; do
     if wait "${CONFIG_PIDS[$node]}"; then
         echo "--- $node: config complete ---"
     else
         echo "--- $node: config FAILED ---"
         cat "/tmp/config_${node}.log"
+        CONFIG_FAILED=1
     fi
 done
+if [[ "$CONFIG_FAILED" == "1" ]]; then
+    echo "ERROR: Config generation failed on one or more nodes"
+    exit 1
+fi
+grep -hE "NM pool|DN heap|Internal name" "/tmp/config_${MASTER_NODE}.log" 2>/dev/null || true
+
+# NodeManagers run exactly on the DataNode hosts (start-yarn.sh reads this).
+printf "%s\n" "${DATANODE_NODES[@]}" > "$CONFIG_DIR/workers"
 
 # ============================================================================
 # STEP 3: Stop any existing Hadoop processes
@@ -411,18 +420,57 @@ if (( FINAL_LIVE < EXPECTED_DATANODES )); then
     exit 1
 fi
 
-# Safety check: in NameNode-only mode, master must not run DataNode.
-# if [[ "$MASTER_HAS_DN" == "0" ]]; then
-#     if ssh "$MASTER_NODE" "pgrep -f 'org.apache.hadoop.hdfs.server.datanode.DataNode' >/dev/null" 2>/dev/null; then
-#         echo "ERROR: DataNode process detected on master ($MASTER_NODE) while MASTER_HAS_DN=0"
-#         exit 1
-#     fi
-# fi
+# ============================================================================
+# STEP 9: Verify the YARN pool
+# ============================================================================
+# Every DataNode host must run a NodeManager with exactly
+# SLOTS_PER_NODE x CONTAINER_MB. In May 2026 runs silently went ahead with one
+# usable container per node, or with NodeManagers that did not match the
+# DataNode names (0% data-local maps); this check stops that early.
+echo ""
+echo "=== STEP 9: Verifying YARN capacity ==="
+
+EXPECTED_NM_MB=$(( SLOTS_PER_NODE * CONTAINER_MB ))
+EXPECTED_TOTAL_MB=$(( EXPECTED_NM_MB * EXPECTED_DATANODES ))
+RM_METRICS_URL="http://${MASTER_NODE}:8088/ws/v1/cluster/metrics"
+
+rm_metrics() {
+    curl -s --max-time 5 "$RM_METRICS_URL" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    m = json.load(sys.stdin)["clusterMetrics"]
+    print(m.get("activeNodes", 0), m.get("totalMB", 0), m.get("totalVirtualCores", 0))
+except Exception:
+    print(0, 0, 0)
+' 2>/dev/null || echo "0 0 0"
+}
+
+YARN_OK=0
+ACTIVE_NMS=0; TOTAL_MB=0; TOTAL_VCORES=0
+for ((waited=0; waited<=180; waited+=5)); do
+    read -r ACTIVE_NMS TOTAL_MB TOTAL_VCORES <<< "$(rm_metrics)"
+    if (( ACTIVE_NMS == EXPECTED_DATANODES && TOTAL_MB == EXPECTED_TOTAL_MB )); then
+        YARN_OK=1
+        break
+    fi
+    sleep 5
+done
+
+echo "  NodeManagers: $ACTIVE_NMS / $EXPECTED_DATANODES active"
+echo "  Pool:         ${TOTAL_MB}MB / ${TOTAL_VCORES} vcores (expected ${EXPECTED_TOTAL_MB}MB = $EXPECTED_DATANODES x $SLOTS_PER_NODE x ${CONTAINER_MB}MB)"
+if [[ "$YARN_OK" != "1" ]]; then
+    echo ""
+    echo "ERROR: YARN capacity does not match the configuration."
+    yarn node -list -all 2>/dev/null || true
+    echo "Check the NodeManager logs under $HADOOP_HOME/logs on the workers."
+    exit 1
+fi
 
 echo ""
 echo "============================================================"
 echo "Single DataNode Cluster Running with K Storage Dirs"
 echo "  NameNode:   $MASTER_NODE:$NAMENODE_PORT"
 echo "  DataNodes:  $FINAL_LIVE live (1 per host, each with $K storage dirs)"
+echo "  YARN:       $ACTIVE_NMS NodeManagers x $SLOTS_PER_NODE containers of ${CONTAINER_MB}MB"
 echo "  HDFS Web UI: http://$MASTER_NODE:9870"
 echo "============================================================"

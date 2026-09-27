@@ -12,6 +12,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/cluster.conf"
+export PATH="$HADOOP_HOME/bin:$HADOOP_HOME/sbin:$PATH"
+# Use the experiment's generated config (workers = DataNode hosts), also when
+# this script is run by hand after an aborted run.
+if [[ -d "$CONFIG_DIR" ]]; then
+    export HADOOP_CONF_DIR="$CONFIG_DIR"
+fi
 
 MAX_K=${1:-512}
 

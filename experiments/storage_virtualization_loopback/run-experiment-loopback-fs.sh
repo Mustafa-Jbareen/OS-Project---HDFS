@@ -2,31 +2,67 @@
 ################################################################################
 # SCRIPT: run-experiment-loopback-fs.sh
 # DESCRIPTION: Main experiment runner for the storage virtualization (loopback
-#              filesystem) scaling experiment. Tests WordCount performance as
-#              the number of storage directories (k loopback filesystems) per
-#              DataNode scales from 2 to 512 (doubling each time).
+#              filesystem) experiment. For each k, builds a cluster where every
+#              DataNode stores its blocks on k loopback ext4 filesystems (k
+#              "virtual disks" carved out of one physical disk), uploads the
+#              WordCount input once, and times WordCount K_REPS times for every
+#              condition (load level x page-cache state).
 #
-#              Each DataNode remains a single process but stores data across
-#              k loopback-mounted filesystems to test storage virtualization.
+# USAGE: [VAR=value ...] bash run-experiment-loopback-fs.sh [K_REPS]
+#   K_REPS - repetitions per k and condition (default: 5)
 #
-# USAGE: bash run-experiment-loopback-fs.sh [K_REPS]
-#   K_REPS - Repetitions per k value (default: 5)
+# SETTINGS (environment variables; cluster defaults in clusters/<name>.conf):
+#   CLUSTER            tapuz | c6620 (default: guessed from the hostname)
+#   K_VALUES           k values, e.g. "1 256 1024" (default "1 256 1024")
+#   K_ORDER            given | random (default given)
+#   INPUT_SIZE_GB      WordCount input size in GB (default 8)
+#   BLOCK_SIZE_MB      HDFS block size of the input in MB (default 32)
+#   CONDITIONS         space-separated list of "maps=N,cache=cold|warm":
+#                        maps  = map tasks per node running at once
+#                                (1..SLOTS_PER_NODE, or "all")
+#                        cache = cold: page cache emptied before each job,
+#                                      so the input is read from disk
+#                                warm: input pre-read into the page cache
+#                      Default: "maps=all,cache=cold". Within each repetition
+#                      the conditions run in a random (seeded) order.
+#   SEED               seed for all random orders (default: current time)
+#   SLOTS_PER_NODE     YARN containers per node          } defaults in
+#   CONTAINER_MB       size of one container in MB       } clusters/<name>.conf
+#   DN_HEAP_MB         DataNode heap in MB or "auto"     }
+#   LOOPBACK_BUDGET_PER_NODE_GB  disk space for all k images of a node
+#   REUPLOAD_EACH_REP  1 = delete and re-upload the input before every job (default 0)
+#   WORDCOUNT_MODE     real | trivial (default real)
+#   MASTER_HAS_DN      1 = also run a DataNode on the master (default 0)
 #
-# OUTPUT: results/storage_virtualization_loopback/run_<timestamp>/ with CSVs and plots
+# OUTPUT: results/storage_virtualization_loopback_<cluster>/run_<timestamp>/
+#   runs.csv       one row per WordCount job: k, condition, runtime, disk
+#                  bytes read/written during the job, Hadoop job counters
+#   summary.txt    per condition and k: mean runtime, change vs the smallest k,
+#                  load (maps running at once), locality, disk reads
+#   results.csv    per-k summary read by plot-results.py (first condition;
+#                  results_<condition>.csv for each condition when several)
+#   metadata.json  all settings, code version, node hardware
+#   configs/k<k>/  the generated Hadoop configs (master + one DataNode host)
+#   jobs/          full output of every WordCount job
+#   namenode_memory/, iostat/, sysstat/ (DataNode pidstat + mpstat),
+#   fragmentation/, hdfs_fsck_k*.txt, input_block_*_k*.txt
 ################################################################################
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$SCRIPT_DIR/../.."
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WORDCOUNT_DIR="$SCRIPT_DIR/../wordcount"
 
-# cluster.conf defines: MASTER_NODE, ALL_NODES, WORKER_NODES,
+# cluster.conf defines: CLUSTER, MASTER_NODE, ALL_NODES, WORKER_NODES,
 # STORAGE_BASE, HADOOP_HOME, IMAGE_DIR, MOUNT_BASE, HADOOP_DATA_DIR,
-# TMP_BASE, CONFIG_DIR.
+# TMP_BASE, CONFIG_DIR and the experiment defaults (SLOTS_PER_NODE, ...).
 source "$SCRIPT_DIR/cluster.conf"
+export PATH="$HADOOP_HOME/bin:$HADOOP_HOME/sbin:$PATH"
+# HDFS paths below use $USER; it is unset in some non-login shells (cron, ...).
+export USER="${USER:-$(id -un)}"
 
-RESULTS_BASE="${RESULTS_BASE:-$PROJECT_ROOT/results/storage_virtualization_loopback}"
+RESULTS_BASE="${RESULTS_BASE:-$PROJECT_ROOT/results/storage_virtualization_loopback_${CLUSTER}}"
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 RUN_DIR="$RESULTS_BASE/run_$TIMESTAMP"
 mkdir -p "$RUN_DIR"
@@ -34,23 +70,17 @@ mkdir -p "$RUN_DIR"
 # ============================================================================
 # PARAMETERS
 # ============================================================================
-K_REPS=${1:-3}  # Number of repetitions per k value
-
-# Cache-warm-vs-cold ablation profile:
-#   30GB input fits in c6620's 128GB RAM, so when DROP_CACHES=0 the second and
-#   third reps read entirely from page cache. 32MB blocks match the historical
-#   m400 baseline (more per-block framework work per byte). k spans 4096x.
-INPUT_SIZE_GB=${INPUT_SIZE_GB:-1}
-BLOCK_SIZE=$((32 * 1024 * 1024))    # 32MB
-BLOCK_SIZE_HUMAN="32MB"
-REPLICATION=3                       # Standard HDFS replication
-
-# k values to test
-K_VALUES=(1 512 1024)
-
-# Loopback sizing policy
-LOOPBACK_BUDGET_PER_NODE_GB=80
-MIN_IMAGE_SIZE_MB=100  # Minimum image size is 100MB
+K_REPS=${1:-${K_REPS:-5}}
+INPUT_SIZE_GB=${INPUT_SIZE_GB:-8}
+BLOCK_SIZE_MB=${BLOCK_SIZE_MB:-32}
+BLOCK_SIZE=$(( BLOCK_SIZE_MB * 1024 * 1024 ))
+BLOCK_SIZE_HUMAN="${BLOCK_SIZE_MB}MB"
+REPLICATION=3
+read -r -a K_VALUES <<< "${K_VALUES:-1 256 1024}"
+K_ORDER=${K_ORDER:-given}
+SEED=${SEED:-$(date +%s)}
+MIN_IMAGE_SIZE_MB=100
+REUPLOAD_EACH_REP=${REUPLOAD_EACH_REP:-0}
 
 # WordCount mode:
 #   real    -> stock hadoop-mapreduce-examples wordcount (full CPU work)
@@ -58,12 +88,12 @@ MIN_IMAGE_SIZE_MB=100  # Minimum image size is 100MB
 WORDCOUNT_MODE=${WORDCOUNT_MODE:-real}
 TRIVIAL_WC_JAR="${TRIVIAL_WC_JAR:-$WORDCOUNT_DIR/trivial/trivial-wordcount.jar}"
 
-# Cache-flush toggle:
-#   1 (default) -> drop_caches between reps; WC reads come from disk
-#   0           -> skip flush; data stays in page cache after upload
-# Set DROP_CACHES=0 on the command line to reproduce the original
-# "cache-warm" condition that exposed framework overhead at high k.
-DROP_CACHES=0   # hardcoded: match best_2/tapuz (no cache drops between reps)
+# Older runs used DROP_CACHES=0/1; map it onto the cache setting.
+if [[ -z "${CACHE_MODE:-}" && -n "${DROP_CACHES:-}" ]]; then
+    if [[ "$DROP_CACHES" == "0" ]]; then CACHE_MODE=warm; else CACHE_MODE=cold; fi
+fi
+CACHE_MODE=${CACHE_MODE:-cold}
+CONDITIONS=${CONDITIONS:-"maps=all,cache=$CACHE_MODE"}
 
 MASTER_HAS_DN=${MASTER_HAS_DN:-0}
 DATANODE_NODES=()
@@ -76,6 +106,10 @@ fi
 NUM_PHYSICAL_NODES=${#ALL_NODES[@]}
 NUM_DATANODE_HOSTS=${#DATANODE_NODES[@]}
 
+# YARN pool per node, and the heap of every task JVM (fixed for all conditions)
+NM_MEM_MB=$(( SLOTS_PER_NODE * CONTAINER_MB ))
+TASK_HEAP_MB=$(( CONTAINER_MB * 8 / 10 ))
+
 # NameNode JMX endpoint for memory monitoring
 NAMENODE_HOST="$MASTER_NODE"
 NAMENODE_HTTP_PORT=9870
@@ -83,11 +117,65 @@ JMX_URL="http://${NAMENODE_HOST}:${NAMENODE_HTTP_PORT}/jmx"
 
 LOG_FILE="$RUN_DIR/experiment.log"
 CSV_FILE="$RUN_DIR/results.csv"
+RUNS_CSV="$RUN_DIR/runs.csv"
 NN_MEMORY_DIR="$RUN_DIR/namenode_memory"
-mkdir -p "$NN_MEMORY_DIR"
-
 IOSTAT_DIR="$RUN_DIR/iostat"
-mkdir -p "$IOSTAT_DIR"
+SYSSTAT_DIR="$RUN_DIR/sysstat"
+JOBS_DIR="$RUN_DIR/jobs"
+mkdir -p "$NN_MEMORY_DIR" "$IOSTAT_DIR" "$SYSSTAT_DIR" "$JOBS_DIR"
+
+# ============================================================================
+# CONDITIONS
+# ============================================================================
+# "maps=N" is applied per job by enlarging the map container so that exactly N
+# maps fit into one NodeManager (the task heap stays TASK_HEAP_MB). Nodes that
+# also host the ApplicationMaster or the reducer may fit one map fewer.
+COND_NAMES=()
+COND_MAPS=()
+COND_CACHE=()
+COND_MAP_MB=()
+read -r -a _COND_SPECS <<< "$CONDITIONS"
+for spec in "${_COND_SPECS[@]}"; do
+    maps=""
+    cache=""
+    IFS=',' read -r -a _kvs <<< "$spec"
+    for kv in "${_kvs[@]}"; do
+        case "$kv" in
+            maps=*)  maps=${kv#maps=} ;;
+            cache=*) cache=${kv#cache=} ;;
+            *) echo "ERROR: unknown setting '$kv' in condition '$spec'" >&2; exit 1 ;;
+        esac
+    done
+    maps=${maps:-all}
+    cache=${cache:-cold}
+    if [[ "$maps" == "all" ]]; then
+        maps=$SLOTS_PER_NODE
+    fi
+    if ! [[ "$maps" =~ ^[0-9]+$ ]] || (( maps < 1 || maps > SLOTS_PER_NODE )); then
+        echo "ERROR: condition '$spec': maps must be 1..$SLOTS_PER_NODE or 'all'" >&2
+        exit 1
+    fi
+    if [[ "$cache" != "cold" && "$cache" != "warm" ]]; then
+        echo "ERROR: condition '$spec': cache must be cold or warm" >&2
+        exit 1
+    fi
+    map_mb=$(( NM_MEM_MB / maps / 512 * 512 ))
+    if (( map_mb < CONTAINER_MB )); then
+        map_mb=$CONTAINER_MB
+    fi
+    name="maps${maps}_${cache}"
+    for existing in "${COND_NAMES[@]}"; do
+        if [[ "$existing" == "$name" ]]; then
+            echo "ERROR: condition $name listed twice" >&2
+            exit 1
+        fi
+    done
+    COND_NAMES+=("$name")
+    COND_MAPS+=("$maps")
+    COND_CACHE+=("$cache")
+    COND_MAP_MB+=("$map_mb")
+done
+NUM_CONDITIONS=${#COND_NAMES[@]}
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -101,6 +189,10 @@ compute_avg() {
     local -n arr=$1
     local sum=0
     local n=${#arr[@]}
+    if (( n == 0 )); then
+        echo "0"
+        return
+    fi
     for v in "${arr[@]}"; do
         sum=$(echo "$sum + $v" | bc)
     done
@@ -117,10 +209,19 @@ compute_stddev() {
     fi
     local sum_sq=0
     for v in "${arr[@]}"; do
-        local diff=$(echo "$v - $avg" | bc)
+        local diff
+        diff=$(echo "$v - $avg" | bc)
         sum_sq=$(echo "$sum_sq + ($diff * $diff)" | bc)
     done
     echo "scale=2; sqrt($sum_sq / ($n - 1))" | bc
+}
+
+# Print the arguments in a random order that depends only on the seed $1.
+seeded_shuffle() {
+    python3 -c 'import random, sys
+items = sys.argv[2:]
+random.Random(int(sys.argv[1])).shuffle(items)
+print(" ".join(items))' "$@"
 }
 
 # Query NameNode JMX for memory + metadata stats.
@@ -129,8 +230,7 @@ query_namenode_jmx() {
     local jmx_data
     jmx_data=$(curl -sL --connect-timeout 5 --max-time 10 "$JMX_URL" 2>/dev/null || echo "{}")
 
-    if command -v python3 &>/dev/null; then
-        echo "$jmx_data" | python3 -c "
+    echo "$jmx_data" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -150,9 +250,6 @@ try:
 except:
     print('0 0 0 0 0')
 " 2>/dev/null || echo "0 0 0 0 0"
-    else
-        echo "0 0 0 0 0"
-    fi
 }
 
 # NameNode memory monitor state
@@ -168,20 +265,10 @@ start_nn_monitor() {
 
     (
         while true; do
-            local ts
+            local ts stats heap_used heap_max blocks files live
             ts=$(date +"%Y-%m-%d %H:%M:%S")
-            local stats
             stats=$(query_namenode_jmx)
-            local heap_used
-            local heap_max
-            local blocks
-            local files
-            local live
-            heap_used=$(echo "$stats" | awk '{print $1}')
-            heap_max=$(echo "$stats" | awk '{print $2}')
-            blocks=$(echo "$stats" | awk '{print $3}')
-            files=$(echo "$stats" | awk '{print $4}')
-            live=$(echo "$stats" | awk '{print $5}')
+            read -r heap_used heap_max blocks files live <<< "$stats"
             echo "$ts,$heap_used,$heap_max,$blocks,$files,$live" >> "$output_csv"
             sleep "$interval"
         done
@@ -199,6 +286,51 @@ stop_nn_monitor() {
     NN_MONITOR_PID=""
 }
 
+# ---- Node hardware + the physical device behind $STORAGE_BASE ----
+# Fills SCRATCH_DEV[node] and writes $RUN_DIR/hardware.txt
+# (node|cores|mem_mb|kernel|device|rotational|model).
+declare -A SCRATCH_DEV
+collect_hardware() {
+    local hw_file="$RUN_DIR/hardware.txt"
+    : > "$hw_file"
+    local node line
+    for node in "${ALL_NODES[@]}"; do
+        line=$(ssh "$node" "bash -s" -- "$node" "$STORAGE_BASE" <<'HWEOF' 2>/dev/null || true
+set +e
+node=$1
+mp=$2
+# -T <path> finds the mount containing <path>; works when $mp is a symlink
+# (c6620 has /scratch -> /mydata). lsblk -s walks from a partition / LVM
+# volume down to the physical disk (sda5 -> sda, dm-0 -> nvme0n1).
+src=$(findmnt -T "$mp" -no SOURCE 2>/dev/null)
+[ -z "$src" ] && src=$(df "$mp" 2>/dev/null | awk 'NR==2{print $1}')
+phys=""
+if [ -n "$src" ]; then
+    phys=$(lsblk -snro NAME,TYPE "$src" 2>/dev/null | awk '$2=="disk"{print $1}' | head -1)
+fi
+if [ -z "$phys" ]; then
+    for c in nvme0n1 sda vda; do
+        if [ -b "/dev/$c" ]; then phys=$c; break; fi
+    done
+fi
+[ -z "$phys" ] && phys=sda
+rota=$(cat "/sys/block/$phys/queue/rotational" 2>/dev/null || echo "?")
+model=$(cat "/sys/block/$phys/device/model" 2>/dev/null | xargs)
+mem=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo)
+echo "$node|$(nproc)|$mem|$(uname -r)|$phys|$rota|${model:-?}"
+HWEOF
+        )
+        if [[ -z "$line" ]]; then
+            log "  WARNING: could not read hardware info from $node"
+            line="$node|?|?|?|sda|?|?"
+        fi
+        echo "$line" >> "$hw_file"
+        SCRATCH_DEV[$node]=$(echo "$line" | cut -d'|' -f5)
+        log "  $node: $(echo "$line" | awk -F'|' -v sb="$STORAGE_BASE" \
+            '{printf "%s cores, %s MB RAM, %s on /dev/%s (rotational=%s, model %s)", $2, $3, sb, $5, $6, $7}')"
+    done
+}
+
 # ---- iostat disk I/O monitor ----
 IOSTAT_PIDS=()
 
@@ -209,54 +341,9 @@ start_iostat_monitor() {
     IOSTAT_PIDS=()
     for node in "${DATANODE_NODES[@]}"; do
         local outfile="$IOSTAT_DIR/iostat_k${k}_${node}.log"
-
-                # Detect the physical block device backing $STORAGE_BASE
-                # (handles LVM-on-NVMe -> /dev/mapper/X -> dm-N -> nvme0n1,
-                # plain partitions like sda1 -> sda, nvme0n1p3 -> nvme0n1).
-                # Strategy: findmnt -> lsblk -snro NAME walks the dependency
-                # tree down to the physical device.
-                local scratch_dev
-                scratch_dev=$(ssh "$node" "STORAGE_BASE='$STORAGE_BASE' bash -s" << 'DEVEOF'
-set +e
-mp="${STORAGE_BASE:-/scratch}"
-
-# -T <path> finds the mount containing <path>; works when $mp is a symlink
-# (c6620 has /scratch -> /mydata).
-src=$(findmnt -T "$mp" -no SOURCE 2>/dev/null)
-[ -z "$src" ] && src=$(df "$mp" 2>/dev/null | awk 'NR==2{print $1}')
-
-# Walk down to the leaf physical device(s). For LVM/dm, lsblk -s with the
-# source device prints all underlying devices. The last NVMe / disk / SSD
-# is the physical one we want to monitor.
-phys=""
-if [ -n "$src" ]; then
-    phys=$(lsblk -snro NAME,TYPE "$src" 2>/dev/null \
-           | awk '$2=="disk"{print $1}' | head -1)
-fi
-
-# Fallbacks: common physical device names
-if [ -z "$phys" ]; then
-    for c in nvme0n1 sda vda; do
-        if [ -b "/dev/$c" ]; then phys=$c; break; fi
-    done
-fi
-[ -z "$phys" ] && phys=sda
-echo "$phys"
-DEVEOF
-                )
-                
-                # Log the  detected device for debugging
-                if [[ -z "$scratch_dev" ]]; then
-                    log "  WARNING: device detection failed on $node, using fallback sda"
-                    scratch_dev="sda"
-                else
-                    log "  Device detection: $STORAGE_BASE backed by $scratch_dev"
-                fi
-
-                log "  iostat on $node: monitoring device=${scratch_dev} ($STORAGE_BASE)"
-                # LANG=C fixes timestamp format. -k forces KB/s units; -y skips the boot-time report.
-                # stdbuf ensures output is flushed even if the SSH session is stopped.
-                ssh "$node" "LANG=C stdbuf -oL -eL iostat -dxkty 5 ${scratch_dev}" > "$outfile" 2>/dev/null &
+        # LANG=C fixes timestamp format. -k forces KB/s units; -y skips the boot-time report.
+        # stdbuf ensures output is flushed even if the SSH session is stopped.
+        ssh "$node" "LANG=C stdbuf -oL -eL iostat -dxkty 5 ${SCRATCH_DEV[$node]}" > "$outfile" 2>/dev/null &
         IOSTAT_PIDS+=($!)
     done
     log "  iostat monitor started on ${#DATANODE_NODES[@]} nodes (k=$k)"
@@ -270,10 +357,44 @@ stop_iostat_monitor() {
     done
     # Kill remote iostat processes
     for node in "${DATANODE_NODES[@]}"; do
-        ssh "$node" "pkill -f 'iostat.*-d.*-x.*-t'" 2>/dev/null || true
+        ssh "$node" "pkill -f '[i]ostat -dxkty'" 2>/dev/null || true
     done
     IOSTAT_PIDS=()
     log "  iostat monitor stopped."
+}
+
+# ---- DataNode process (pidstat) + whole-node CPU (mpstat) monitors ----
+# Where does the extra time at high k go? These show the DataNode JVM's CPU,
+# memory and I/O, and the node's %usr/%sys/%iowait, every 5 s.
+SYSSTAT_PIDS=()
+
+start_sysstat_monitors() {
+    local k=$1
+    SYSSTAT_PIDS=()
+    for node in "${DATANODE_NODES[@]}"; do
+        ssh "$node" 'command -v pidstat >/dev/null || exit 0
+dnpid=$(pgrep -f "[o]rg.apache.hadoop.hdfs.server.datanode.DataNode" | head -1)
+[ -n "$dnpid" ] || exit 0
+LANG=C exec stdbuf -oL pidstat -h -u -r -d -p "$dnpid" 5' \
+            > "$SYSSTAT_DIR/pidstat_datanode_k${k}_${node}.log" 2>/dev/null &
+        SYSSTAT_PIDS+=($!)
+        ssh "$node" 'command -v mpstat >/dev/null || exit 0
+LANG=C exec stdbuf -oL mpstat 5' \
+            > "$SYSSTAT_DIR/mpstat_k${k}_${node}.log" 2>/dev/null &
+        SYSSTAT_PIDS+=($!)
+    done
+    log "  pidstat (DataNode) + mpstat monitors started (k=$k)"
+}
+
+stop_sysstat_monitors() {
+    for pid in "${SYSSTAT_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+    for node in "${DATANODE_NODES[@]}"; do
+        ssh "$node" "pkill -f '[p]idstat -h -u -r -d -p'; pkill -f '[m]pstat 5'" 2>/dev/null || true
+    done
+    SYSSTAT_PIDS=()
 }
 
 # Parse raw iostat logs into a summary CSV for a given k value.
@@ -424,7 +545,7 @@ try:
         # If clocks are skewed or timestamps were missing, fall back to no filtering.
         kept, dropped = parse_logs(filter_windows=False)
         print(f"WARNING: no iostat samples matched WordCount windows for k={k}; wrote unfiltered data")
-    
+
     print(f"Parsed iostat summary: {summary_path} (kept={kept}, dropped_outside_wc={dropped}, windows={len(wc_windows)})")
 except Exception as e:
     import traceback
@@ -439,7 +560,7 @@ IOSTAT_PY
 # Extract peak heap from a monitor CSV
 get_peak_heap_mb() {
     local csv_file=$1
-    if [[ -f "$csv_file" ]] && command -v python3 &>/dev/null; then
+    if [[ -f "$csv_file" ]]; then
         python3 -c "
 import csv
 peak = 0
@@ -462,7 +583,7 @@ print(peak)
 # Get average heap from a monitor CSV
 get_avg_heap_mb() {
     local csv_file=$1
-    if [[ -f "$csv_file" ]] && command -v python3 &>/dev/null; then
+    if [[ -f "$csv_file" ]]; then
         python3 -c "
 import csv
 values = []
@@ -485,14 +606,236 @@ calc_image_size_mb() {
     local k=$1
     # Budget-based sizing (split budget across k loopback FSes)
     # Work in MB from the start to avoid integer truncation (200GB/256 = 0GB)
-    local budget_based_mb=$(( (LOOPBACK_BUDGET_PER_NODE_GB * 1024) / k ))
-
-    # Use budget-based size, but enforce minimum
-    local image_mb=$budget_based_mb
+    local image_mb=$(( (LOOPBACK_BUDGET_PER_NODE_GB * 1024) / k ))
     if (( image_mb < MIN_IMAGE_SIZE_MB )); then
         image_mb=$MIN_IMAGE_SIZE_MB
     fi
     echo "$image_mb"
+}
+
+# Generate the WordCount input and upload it to HDFS (replaces any old input).
+upload_input() {
+    hdfs dfs -rm -r -f /user/$USER/wordcount/input >/dev/null 2>&1 || true
+    hdfs dfs -mkdir -p /user/$USER/wordcount/input
+    bash "$WORDCOUNT_DIR/generate-input.sh" "$((INPUT_SIZE_GB * 1024))" "$BLOCK_SIZE" >> "$LOG_FILE" 2>&1
+}
+
+# ---- Page cache control ----
+# cold: empty the page cache on every DataNode host, so the job reads from disk.
+#   The global drop_caches needs root. Tapuz grants passwordless sudo only for a
+#   few commands (not sh/tee), so there the old `sudo sh -c "echo 3 > ..."`
+#   silently did nothing. Fallback without root: evict just the experiment's
+#   files (HDFS block files + loopback images, i.e. both cached copies) with
+#   posix_fadvise(DONTNEED), which only needs read access.
+# warm: read every local block file once, so the job reads from the page cache.
+# Prints one line per node with what was done.
+prepare_cache() {
+    local mode=$1
+    local node
+    local -a pids=()
+    for node in "${DATANODE_NODES[@]}"; do
+        if [[ "$mode" == "cold" ]]; then
+            ssh "$node" "bash -s" -- "$MOUNT_BASE" "$IMAGE_DIR" > "$RUN_DIR/.cache_${node}.out" 2>&1 <<'COLDEOF' &
+set -u
+mount_base=$1
+image_dir=$2
+# Two syncs: the first flushes the loopback filesystems into their image
+# files, the second flushes the images themselves.
+sync; sync
+if sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null; then
+    echo "drop_caches"
+    exit 0
+fi
+python3 - "$mount_base" "$image_dir" <<'PY'
+import glob, os, sys
+mount_base, image_dir = sys.argv[1], sys.argv[2]
+paths = glob.glob(os.path.join(mount_base, "dn*", "hdfs_data", "**", "blk_*"), recursive=True)
+paths += glob.glob(os.path.join(image_dir, "hdfs_dn*.img"))
+evicted = 0
+for p in paths:
+    try:
+        fd = os.open(p, os.O_RDONLY)
+    except OSError:
+        continue
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        evicted += 1
+    finally:
+        os.close(fd)
+print(f"fadvise_dontneed files={evicted}")
+PY
+COLDEOF
+        else
+            ssh "$node" "bash -s" -- "$MOUNT_BASE" > "$RUN_DIR/.cache_${node}.out" 2>&1 <<'WARMEOF' &
+set -u
+mount_base=$1
+find "$mount_base"/dn*/hdfs_data -type f -name 'blk_*' -exec cat {} + > /dev/null 2>&1
+free -m | awk '/^Mem:/ {print "prefetched; page_cache_mb=" $6 " available_mb=" $7}'
+WARMEOF
+        fi
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    local summary=""
+    for node in "${DATANODE_NODES[@]}"; do
+        summary+=" $node: $(tr '\n' ' ' < "$RUN_DIR/.cache_${node}.out" 2>/dev/null)"
+        rm -f "$RUN_DIR/.cache_${node}.out"
+    done
+    log "  Cache $mode:$summary"
+}
+
+# Total sectors read and written on the scratch disks of all DataNode hosts.
+# Prints "read_sectors write_sectors" (512-byte sectors, from /proc/diskstats).
+disk_counters() {
+    local total_r=0 total_w=0 r w node
+    for node in "${DATANODE_NODES[@]}"; do
+        read -r r w <<< "$(ssh "$node" "awk -v d=${SCRATCH_DEV[$node]} '\$3==d {print \$6, \$10}' /proc/diskstats" 2>/dev/null || echo "0 0")"
+        total_r=$(( total_r + ${r:-0} ))
+        total_w=$(( total_w + ${w:-0} ))
+    done
+    echo "$total_r $total_w"
+}
+
+EXAMPLES_JAR=$(compgen -G "$HADOOP_HOME/share/hadoop/mapreduce/hadoop-mapreduce-examples-*.jar" | head -1 || true)
+
+# Run one WordCount job with map containers of $1 MB; full output to $2.
+run_wordcount() {
+    local map_mb=$1
+    local job_log=$2
+    local -a opts=(
+        -D "mapreduce.jobhistory.address=${MASTER_NODE}:10020"
+        -D "mapreduce.jobhistory.webapp.address=${MASTER_NODE}:19888"
+        -D "mapreduce.map.memory.mb=${map_mb}"
+        -D "mapreduce.map.java.opts=-Xmx${TASK_HEAP_MB}m"
+    )
+    if [[ "$WORDCOUNT_MODE" == "trivial" ]]; then
+        hadoop jar "$TRIVIAL_WC_JAR" TrivialWordCount "${opts[@]}" \
+            /user/$USER/wordcount/input /user/$USER/wordcount/output 2>&1 \
+            | tee "$job_log" >> "$LOG_FILE"
+    else
+        hadoop jar "$EXAMPLES_JAR" wordcount "${opts[@]}" \
+            /user/$USER/wordcount/input /user/$USER/wordcount/output 2>&1 \
+            | tee "$job_log" >> "$LOG_FILE"
+    fi
+}
+
+# Run and record one timed job: k, repetition, condition index.
+declare -A COND_RUNTIMES
+FAILED_JOBS=0
+run_one_job() {
+    local k=$1 rep=$2 ci=$3
+    local name=${COND_NAMES[$ci]}
+    local maps=${COND_MAPS[$ci]}
+    local cache=${COND_CACHE[$ci]}
+    local map_mb=${COND_MAP_MB[$ci]}
+    local job_log="$JOBS_DIR/k${k}_rep${rep}_${name}.log"
+
+    log ""
+    log "  Rep $rep/$K_REPS  k=$k  condition=$name (maps/node=$maps, map container=${map_mb}MB, cache=$cache)"
+
+    hdfs dfs -rm -r -f /user/$USER/wordcount/output >/dev/null 2>&1 || true
+    if [[ "$REUPLOAD_EACH_REP" == "1" ]]; then
+        log "  Re-uploading input..."
+        upload_input
+    fi
+    prepare_cache "$cache"
+
+    local rs0 ws0 rs1 ws1 t0 t1 start_epoch end_epoch status=ok
+    read -r rs0 ws0 <<< "$(disk_counters)"
+    start_epoch=$(date +%s)
+    t0=$(date +%s.%N)
+    if ! run_wordcount "$map_mb" "$job_log"; then
+        status=failed
+    fi
+    t1=$(date +%s.%N)
+    end_epoch=$(date +%s)
+    read -r rs1 ws1 <<< "$(disk_counters)"
+    if ! grep -q "completed successfully" "$job_log"; then
+        status=failed
+    fi
+
+    local runtime disk_read_mb disk_write_mb counters
+    local maps_launched data_local map_ms red_ms cpu_ms gc_ms conc avg_map_s
+    runtime=$(echo "scale=2; $t1 - $t0" | bc)
+    disk_read_mb=$(( (rs1 - rs0) / 2048 ))
+    disk_write_mb=$(( (ws1 - ws0) / 2048 ))
+    echo "$start_epoch $end_epoch" >> "$IOSTAT_DIR/wc_windows_k${k}.txt"
+
+    counters=$(python3 "$SCRIPT_DIR/analyze-counters.py" --job-log "$job_log" 2>/dev/null || echo "0 0 0 0 0 0")
+    read -r maps_launched data_local map_ms red_ms cpu_ms gc_ms <<< "$counters"
+    conc=$(awk -v m="$map_ms" -v r="$runtime" 'BEGIN {printf "%.1f", (r > 0) ? m / 1000 / r : 0}')
+    avg_map_s=$(awk -v m="$map_ms" -v n="$maps_launched" 'BEGIN {printf "%.2f", (n > 0) ? m / 1000 / n : 0}')
+
+    echo "$TIMESTAMP,$k,$rep,$name,$maps,$map_mb,$cache,$status,$start_epoch,$end_epoch,$runtime,$disk_read_mb,$disk_write_mb,$maps_launched,$data_local,$map_ms,$red_ms,$cpu_ms,$gc_ms,$conc,$avg_map_s" >> "$RUNS_CSV"
+    log "  Runtime: ${runtime}s [$status]  maps: $maps_launched ($data_local data-local), $conc running at once on average, ${avg_map_s}s each; disk read during job: ${disk_read_mb}MB"
+
+    if [[ "$status" == "ok" ]]; then
+        COND_RUNTIMES[$ci]+="${runtime};"
+    else
+        FAILED_JOBS=$(( FAILED_JOBS + 1 ))
+        log "  WARNING: job failed; see $job_log"
+    fi
+}
+
+# Copy the generated Hadoop configs (master + first DataNode host) into the run dir.
+save_configs() {
+    local k=$1
+    local dest="$RUN_DIR/configs/k$k"
+    local dn=${DATANODE_NODES[0]}
+    mkdir -p "$dest/$MASTER_NODE" "$dest/$dn"
+    cp "$CONFIG_DIR"/*.xml "$CONFIG_DIR"/dn-env-override.sh "$CONFIG_DIR"/workers "$dest/$MASTER_NODE/" 2>/dev/null || true
+    scp -q "$dn:$CONFIG_DIR/*.xml" "$dn:$CONFIG_DIR/dn-env-override.sh" "$dest/$dn/" 2>/dev/null || true
+}
+
+# One results.csv-format row for condition index $1 into file $2.
+write_results_row() {
+    local ci=$1 csv=$2
+    local -a rts=()
+    local raw=${COND_RUNTIMES[$ci]:-}
+    if [[ -n "$raw" ]]; then
+        IFS=';' read -r -a rts <<< "${raw%;}"
+    fi
+    local avg stddev individual
+    avg=$(compute_avg rts)
+    stddev=$(compute_stddev rts "$avg")
+    individual=$(IFS=";"; echo "${rts[*]}")
+    echo "$k,$TOTAL_STORAGE_DIRS,$LIVE_DNS,$avg,$stddev,$individual,$NN_HEAP_BEFORE,$NN_HEAP_PEAK,$NN_HEAP_AVG,$NN_BLOCK_COUNT,$block_counts_per_fs,$input_block_counts_per_fs,$fs_used_mb_per_fs" >> "$csv"
+    log "  k=$k  ${COND_NAMES[$ci]}: average ${avg}s  stddev ${stddev}s  runs: $individual"
+}
+
+# Stop early if the cluster cannot hold the run.
+preflight() {
+    local fail=0 tool node avail_gb
+    for tool in bc python3 curl hdfs hadoop yarn; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo "  missing on $(hostname): $tool"
+            fail=1
+        fi
+    done
+    if [[ "$WORDCOUNT_MODE" == "trivial" && ! -f "$TRIVIAL_WC_JAR" ]]; then
+        echo "  WORDCOUNT_MODE=trivial but the jar is missing: $TRIVIAL_WC_JAR (run wordcount/trivial/build.sh)"
+        fail=1
+    fi
+    if [[ "$WORDCOUNT_MODE" != "trivial" && -z "$EXAMPLES_JAR" ]]; then
+        echo "  hadoop-mapreduce-examples jar not found under $HADOOP_HOME/share/hadoop/mapreduce"
+        fail=1
+    fi
+    local need_gb=$(( LOOPBACK_BUDGET_PER_NODE_GB + 5 ))
+    for node in "${DATANODE_NODES[@]}"; do
+        avail_gb=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
+            "df -BG --output=avail '$STORAGE_BASE' | tail -1 | tr -dc '0-9'" 2>/dev/null || echo "")
+        if [[ -z "$avail_gb" ]]; then
+            echo "  cannot reach $node over passwordless ssh"
+            fail=1
+        elif (( avail_gb < need_gb )); then
+            echo "  $node: only ${avail_gb}GB free on $STORAGE_BASE, need ${need_gb}GB"
+            echo "    (leftover loop images from an aborted run? bash stop-single-dn-cluster.sh 1024)"
+            fail=1
+        fi
+    done
+    return $fail
 }
 
 # ============================================================================
@@ -502,9 +845,11 @@ cleanup() {
     echo ""
     log "Caught interrupt, cleaning up..."
     stop_iostat_monitor
+    stop_sysstat_monitors
     stop_nn_monitor
     pkill -P $$ 2>/dev/null || true
     log "Cleanup complete. Partial results in: $RUN_DIR"
+    log "The cluster is still up; stop it with: bash $SCRIPT_DIR/stop-single-dn-cluster.sh 1024"
     exit 1
 }
 trap cleanup SIGINT SIGTERM
@@ -513,27 +858,44 @@ trap cleanup SIGINT SIGTERM
 # MAIN EXPERIMENT
 # ============================================================================
 
+case "$K_ORDER" in
+    given) ;;
+    random) read -r -a K_VALUES <<< "$(seeded_shuffle "$SEED" "${K_VALUES[@]}")" ;;
+    *) echo "ERROR: K_ORDER must be given or random" >&2; exit 1 ;;
+esac
+
+if [[ -f "$PROJECT_ROOT/VERSION" ]]; then
+    CODE_VERSION=$(head -1 "$PROJECT_ROOT/VERSION")
+elif git -C "$PROJECT_ROOT" rev-parse --short HEAD >/dev/null 2>&1; then
+    CODE_VERSION=$(git -C "$PROJECT_ROOT" rev-parse --short HEAD)
+    git -C "$PROJECT_ROOT" diff --quiet 2>/dev/null || CODE_VERSION+="-dirty"
+else
+    CODE_VERSION="unknown"
+fi
+
 echo "============================================================"
 echo "Storage Virtualization Loopback Filesystem Experiment"
 echo "============================================================"
-echo "Run ID:           $TIMESTAMP"
-echo "Input size:       ${INPUT_SIZE_GB}GB"
-echo "Block size:       $BLOCK_SIZE_HUMAN"
+echo "Run ID:           $TIMESTAMP   (code $CODE_VERSION)"
+echo "Cluster:          $CLUSTER"
+echo "Input size:       ${INPUT_SIZE_GB}GB in ${BLOCK_SIZE_HUMAN} blocks, uploaded $( [[ "$REUPLOAD_EACH_REP" == "1" ]] && echo "before every job" || echo "once per k")"
 echo "Replication:      $REPLICATION"
 echo "WordCount mode:   $WORDCOUNT_MODE"
-echo "Drop caches:      $DROP_CACHES  (1=cold reads, 0=cache-warm ablation)"
+echo "YARN pool:        $SLOTS_PER_NODE x ${CONTAINER_MB}MB per node, task heap ${TASK_HEAP_MB}MB"
+echo "DataNode heap:    ${DN_HEAP_MB}MB"
+echo "Conditions:       ${COND_NAMES[*]}"
 echo "Master has DN:    $MASTER_HAS_DN"
 echo "Storage base:     $STORAGE_BASE  (HADOOP_HOME=$HADOOP_HOME)"
 echo "Loopback budget:  ${LOOPBACK_BUDGET_PER_NODE_GB}GB/node (min ${MIN_IMAGE_SIZE_MB}MB/image)"
 echo "Physical nodes:   $NUM_PHYSICAL_NODES (${ALL_NODES[*]})"
 echo "DataNode hosts:   $NUM_DATANODE_HOSTS (${DATANODE_NODES[*]})"
-echo "k values:         ${K_VALUES[*]}"
-echo "Repetitions (K):  $K_REPS"
+echo "k values:         ${K_VALUES[*]}  (order: $K_ORDER, seed $SEED)"
+echo "Repetitions:      $K_REPS per k and condition"
 echo "Results:          $RUN_DIR"
 echo ""
 echo "Resource plan per k value:"
 for k in "${K_VALUES[@]}"; do
-    img_mb=$(calc_image_size_mb $k)
+    img_mb=$(calc_image_size_mb "$k")
     img_gb=$(awk "BEGIN {printf \"%.2f\", $img_mb/1024}")
     total_dirs=$(( NUM_DATANODE_HOSTS * k ))
     total_disk_mb=$(( img_mb * k ))
@@ -543,18 +905,30 @@ done
 echo "============================================================"
 echo ""
 
-# Save metadata
+log "Pre-flight checks..."
+if ! preflight 2>&1 | tee -a "$LOG_FILE"; then
+    log "Pre-flight checks failed; nothing was started."
+    exit 1
+fi
 
-# Export new MB-based minimum
+log "Node hardware:"
+collect_hardware
+
+# Save metadata
 export LOOPBACK_BUDGET_PER_NODE_GB MIN_IMAGE_SIZE_MB K_REPS
 export TIMESTAMP INPUT_SIZE_GB BLOCK_SIZE BLOCK_SIZE_HUMAN REPLICATION
 export NUM_PHYSICAL_NODES RUN_DIR NUM_DATANODE_HOSTS MASTER_HAS_DN
-export WORDCOUNT_MODE STORAGE_BASE DROP_CACHES
+export WORDCOUNT_MODE STORAGE_BASE CLUSTER CODE_VERSION SEED K_ORDER REUPLOAD_EACH_REP
+export SLOTS_PER_NODE CONTAINER_MB TASK_HEAP_MB DN_HEAP_MB
 
 K_VALUES_CSV=$(IFS=,; echo "${K_VALUES[*]}")
 NODE_NAMES_CSV=$(IFS=,; echo "${ALL_NODES[*]}")
 DN_HOST_NAMES_CSV=$(IFS=,; echo "${DATANODE_NODES[*]}")
-export K_VALUES_CSV NODE_NAMES_CSV DN_HOST_NAMES_CSV
+COND_SPEC_CSV=""
+for ((ci=0; ci<NUM_CONDITIONS; ci++)); do
+    COND_SPEC_CSV+="${COND_NAMES[$ci]}:${COND_MAPS[$ci]}:${COND_MAP_MB[$ci]}:${COND_CACHE[$ci]},"
+done
+export K_VALUES_CSV NODE_NAMES_CSV DN_HOST_NAMES_CSV COND_SPEC_CSV
 
 python3 - <<'PY' 2>/dev/null || true
 import json
@@ -567,9 +941,27 @@ def parse_int_list(csv_text: str):
         return []
     return [int(x.strip()) for x in csv_text.split(',') if x.strip()]
 
+conditions = []
+for item in os.environ.get("COND_SPEC_CSV", "").split(","):
+    if item:
+        name, maps, map_mb, cache = item.split(":")
+        conditions.append({"name": name, "maps_per_node": int(maps),
+                           "map_container_mb": int(map_mb), "cache": cache})
+
+hardware = []
+hw_path = os.path.join(os.environ["RUN_DIR"], "hardware.txt")
+if os.path.exists(hw_path):
+    for line in open(hw_path):
+        f = line.strip().split("|")
+        if len(f) == 7:
+            hardware.append(dict(zip(
+                ["node", "cores", "mem_mb", "kernel", "scratch_device", "rotational", "model"], f)))
+
 meta = {
     "run_id": os.environ["TIMESTAMP"],
     "experiment_type": "storage_virtualization_loopback",
+    "cluster": os.environ["CLUSTER"],
+    "code_version": os.environ["CODE_VERSION"],
     "input_size_gb": int(os.environ["INPUT_SIZE_GB"]),
     "block_size_bytes": int(os.environ["BLOCK_SIZE"]),
     "block_size_human": os.environ["BLOCK_SIZE_HUMAN"],
@@ -580,12 +972,20 @@ meta = {
     "datanode_host_names": [x for x in os.environ.get("DN_HOST_NAMES_CSV", "").split(',') if x],
     "master_has_datanode": os.environ.get("MASTER_HAS_DN", "1") != "0",
     "k_values": parse_int_list(os.environ.get("K_VALUES_CSV", "")),
+    "k_order": os.environ["K_ORDER"],
+    "seed": int(os.environ["SEED"]),
     "loopback_budget_per_node_gb": int(os.environ["LOOPBACK_BUDGET_PER_NODE_GB"]),
     "min_image_size_mb": int(os.environ["MIN_IMAGE_SIZE_MB"]),
     "repetitions": int(os.environ["K_REPS"]),
+    "conditions": conditions,
+    "yarn_slots_per_node": int(os.environ["SLOTS_PER_NODE"]),
+    "yarn_container_mb": int(os.environ["CONTAINER_MB"]),
+    "task_heap_mb": int(os.environ["TASK_HEAP_MB"]),
+    "datanode_heap_mb": os.environ["DN_HEAP_MB"],
+    "input_uploaded": "every job" if os.environ["REUPLOAD_EACH_REP"] == "1" else "once per k",
     "wordcount_mode": os.environ.get("WORDCOUNT_MODE", "real"),
     "storage_base": os.environ.get("STORAGE_BASE", "/scratch"),
-    "drop_caches_between_reps": os.environ.get("DROP_CACHES", "1") == "1",
+    "hardware": hardware,
     "start_time": datetime.now().astimezone().isoformat(timespec="seconds"),
 }
 
@@ -594,10 +994,15 @@ with open(out_path, "w", encoding="utf-8") as f:
     json.dump(meta, f, indent=4)
 PY
 
-export K_VALUES_CSV
-
-# Initialize CSV (runtime + NameNode memory columns + per-FS block counts + input block distribution + FS capacity)
-echo "k_storage_dirs,total_storage_dirs,datanodes,avg_runtime_seconds,stddev_runtime,individual_runtimes,nn_heap_before_mb,nn_heap_peak_mb,nn_heap_avg_mb,nn_block_count,block_counts_per_fs,input_block_counts_per_fs,fs_used_mb_per_fs" > "$CSV_FILE"
+# Initialize CSVs
+RESULTS_HEADER="k_storage_dirs,total_storage_dirs,datanodes,avg_runtime_seconds,stddev_runtime,individual_runtimes,nn_heap_before_mb,nn_heap_peak_mb,nn_heap_avg_mb,nn_block_count,block_counts_per_fs,input_block_counts_per_fs,fs_used_mb_per_fs"
+echo "$RESULTS_HEADER" > "$CSV_FILE"
+if (( NUM_CONDITIONS > 1 )); then
+    for name in "${COND_NAMES[@]}"; do
+        echo "$RESULTS_HEADER" > "$RUN_DIR/results_${name}.csv"
+    done
+fi
+echo "run_id,k,rep,condition,maps_per_node,map_container_mb,cache,status,start_epoch,end_epoch,runtime_s,disk_read_mb,disk_write_mb,launched_maps,data_local_maps,total_map_ms,total_reduce_ms,cpu_ms,gc_ms,avg_concurrent_maps,avg_map_s" > "$RUNS_CSV"
 
 # ============================================================================
 # Iterate over k values
@@ -605,35 +1010,32 @@ echo "k_storage_dirs,total_storage_dirs,datanodes,avg_runtime_seconds,stddev_run
 
 for k in "${K_VALUES[@]}"; do
     TOTAL_STORAGE_DIRS=$(( NUM_DATANODE_HOSTS * k ))
-    IMAGE_SIZE_MB=$(calc_image_size_mb $k)
+    IMAGE_SIZE_MB=$(calc_image_size_mb "$k")
+    COND_RUNTIMES=()
 
     log "Running experiment for k=$k with $TOTAL_STORAGE_DIRS total storage dirs..."
 
     # -- Step 1: Start the single-DN cluster with k storage dirs --
     log "Starting cluster with k=$k storage dirs per DataNode..."
     # Pass image size in MB to avoid integer truncation (200MB / 1024 = 0GB)
-    # DN heap "auto": generate-single-dn-configs.sh sizes it from each node's RAM.
-    bash "$SCRIPT_DIR/start-single-dn-cluster.sh" "$k" "$IMAGE_SIZE_MB" "5500" "$REPLICATION" 2>&1 | tee -a "$LOG_FILE"
+    bash "$SCRIPT_DIR/start-single-dn-cluster.sh" "$k" "$IMAGE_SIZE_MB" "$DN_HEAP_MB" "$REPLICATION" 2>&1 | tee -a "$LOG_FILE"
 
     # Record actual live DataNodes
     export HADOOP_CONF_DIR="$CONFIG_DIR"
     LIVE_DNS=$(hdfs dfsadmin -report 2>/dev/null | grep -i "Live datanodes" | grep -o '[0-9]*' || echo "0")
     log "Live DataNodes: $LIVE_DNS (expected $NUM_DATANODE_HOSTS)"
+    save_configs "$k"
 
-    # -- Step 2: Generate and upload input data --
-    log "Generating ${INPUT_SIZE_GB}GB input..."
-    hdfs dfs -mkdir -p /user/$USER/wordcount/input 2>/dev/null || true
-    bash "$WORDCOUNT_DIR/generate-input.sh" "$((INPUT_SIZE_GB * 1024))" "$BLOCK_SIZE" 2>&1 | tee -a "$LOG_FILE"
-
+    # -- Step 2: Generate and upload input data (once for all jobs of this k) --
+    log "Generating and uploading ${INPUT_SIZE_GB}GB input..."
+    upload_input
     log "Input uploaded. HDFS status:"
     hdfs dfs -ls /user/$USER/wordcount/input 2>&1 | tee -a "$LOG_FILE"
 
     # Snapshot NameNode memory before WordCount
     log "Querying NameNode memory (before WordCount)..."
     sleep 5
-    NN_BEFORE=$(query_namenode_jmx)
-    NN_HEAP_BEFORE=$(echo "$NN_BEFORE" | awk '{print $1}')
-    NN_BLOCK_COUNT=$(echo "$NN_BEFORE" | awk '{print $3}')
+    read -r NN_HEAP_BEFORE _ NN_BLOCK_COUNT _ _ <<< "$(query_namenode_jmx)"
     log "  NN heap before: ${NN_HEAP_BEFORE}MB, blocks: $NN_BLOCK_COUNT"
 
     # -- Step 2.5: Fragmentation snapshot (mentor's filefrag check) --
@@ -643,87 +1045,34 @@ for k in "${K_VALUES[@]}"; do
     bash "$SCRIPT_DIR/measure-fragmentation.sh" "$k" "$RUN_DIR/fragmentation" "${DATANODE_NODES[@]}" 2>&1 | tee -a "$LOG_FILE" || \
         log "  WARNING: fragmentation step failed for k=$k (continuing)"
 
-    # Monitor NameNode memory while WordCount runs
+    # Monitor NameNode memory, disks and the DataNode processes while WordCount runs
     NN_MONITOR_CSV="$NN_MEMORY_DIR/nn_memory_k${k}.csv"
     start_nn_monitor "$NN_MONITOR_CSV" 5
     start_iostat_monitor "$k"
+    start_sysstat_monitors "$k"
 
     # Per-run WC windows (epoch seconds). parse_iostat_logs uses this file to
-    # drop iostat samples captured during `hdfs dfs -rm` gaps between runs.
-    WC_WINDOWS_FILE="$IOSTAT_DIR/wc_windows_k${k}.txt"
-    : > "$WC_WINDOWS_FILE"
+    # drop iostat samples captured between jobs.
+    : > "$IOSTAT_DIR/wc_windows_k${k}.txt"
 
-    # -- Step 3: Run WordCount K_REPS times --
-    declare -a runtimes=()
-
-    for ((run_i=1; run_i<=K_REPS; run_i++)); do
-        log ""
-        log "  Run $run_i/$K_REPS (k=$k)..."
-
-        # Remove output from previous run
-        hdfs dfs -rm -r -f /user/$USER/wordcount/output 2>/dev/null || true
-
-        # Drop HDFS input and OS caches, then re-upload (cold reads every rep)
-        hdfs dfs -rm -r -f /user/$USER/wordcount/input 2>/dev/null || true
-        for node in "${DATANODE_NODES[@]}"; do
-            ssh "$node" "sudo sync && sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'" 2>/dev/null || \
-            ssh "$node" "sync && echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null || true
+    # -- Step 3: K_REPS repetitions; all conditions in every repetition, in a
+    #    random order (seeded by SEED, k and the repetition number).
+    for ((rep=1; rep<=K_REPS; rep++)); do
+        read -r -a ORDER <<< "$(seeded_shuffle "$(( SEED + k * 1000 + rep ))" "${!COND_NAMES[@]}")"
+        for ci in "${ORDER[@]}"; do
+            run_one_job "$k" "$rep" "$ci"
         done
-        sleep 1
-        hdfs dfs -mkdir -p /user/$USER/wordcount/input 2>/dev/null || true
-        bash "$WORDCOUNT_DIR/generate-input.sh" "$((INPUT_SIZE_GB * 1024))" "$BLOCK_SIZE" 2>/dev/null || true
-        sleep 2
-
-        # Time the WordCount job (real or trivial depending on $WORDCOUNT_MODE)
-        START_TIME=$(date +%s.%N)
-        WC_START_EPOCH=$(date +%s)
-
-        if [[ "$WORDCOUNT_MODE" == "trivial" ]]; then
-            if [[ ! -f "$TRIVIAL_WC_JAR" ]]; then
-                log "  ERROR: WORDCOUNT_MODE=trivial but jar missing: $TRIVIAL_WC_JAR"
-                exit 1
-            fi
-            hadoop jar "$TRIVIAL_WC_JAR" TrivialWordCount \
-                -D mapreduce.jobhistory.address=${MASTER_NODE}:10020 \
-                -D mapreduce.jobhistory.webapp.address=${MASTER_NODE}:19888 \
-                /user/$USER/wordcount/input \
-                /user/$USER/wordcount/output 2>&1 | tee -a "$LOG_FILE"
-        else
-            hadoop jar "$HADOOP_HOME/share/hadoop/mapreduce/hadoop-mapreduce-examples-"*.jar \
-                wordcount \
-                -D mapreduce.jobhistory.address=${MASTER_NODE}:10020 \
-                -D mapreduce.jobhistory.webapp.address=${MASTER_NODE}:19888 \
-                /user/$USER/wordcount/input \
-                /user/$USER/wordcount/output 2>&1 | tee -a "$LOG_FILE"
-        fi
-
-        WC_END_EPOCH=$(date +%s)
-        END_TIME=$(date +%s.%N)
-        RUNTIME=$(echo "scale=2; $END_TIME - $START_TIME" | bc)
-
-        echo "$WC_START_EPOCH $WC_END_EPOCH" >> "$WC_WINDOWS_FILE"
-
-        log "  Runtime: ${RUNTIME}s"
-        runtimes+=("$RUNTIME")
     done
 
     # -- Step 4: Stop monitors and collect stats --
     stop_iostat_monitor
+    stop_sysstat_monitors
     parse_iostat_logs "$k"
     stop_nn_monitor
     NN_HEAP_PEAK=$(get_peak_heap_mb "$NN_MONITOR_CSV")
     NN_HEAP_AVG=$(get_avg_heap_mb "$NN_MONITOR_CSV")
     log "  NN heap peak during WordCount: ${NN_HEAP_PEAK}MB"
     log "  NN heap avg during WordCount:  ${NN_HEAP_AVG}MB"
-
-    # -- Step 5: Compute timing stats --
-    avg=$(compute_avg runtimes)
-    stddev=$(compute_stddev runtimes "$avg")
-    individual=$(IFS=";"; echo "${runtimes[*]}")
-
-    log ""
-    log "  k=$k  Average: ${avg}s  StdDev: ${stddev}s  Runs: $individual"
-    log "  k=$k  NN: heap_before=${NN_HEAP_BEFORE}MB peak=${NN_HEAP_PEAK}MB avg=${NN_HEAP_AVG}MB blocks=$NN_BLOCK_COUNT"
 
     # -- Step 4.5: Flush caches and stabilize before block collection --
     log "Flushing caches and stabilizing DataNode storage..."
@@ -738,7 +1087,7 @@ for k in "${K_VALUES[@]}"; do
     # Collect per-filesystem block counts (after WordCount output removed, input still present)
     log "Collecting per-filesystem block counts..."
     block_counts_per_fs=""
-    > "$RUN_DIR/block_counts_tmp.txt"
+    : > "$RUN_DIR/block_counts_tmp.txt"
     for NODE in "${DATANODE_NODES[@]}"; do
         # Count block DATA files only (exclude .meta checksum files; each block has both)
         # Path: ${MOUNT_BASE}/dn<i>/hdfs_data/current/BP-<pool-id>/current/.../blk_*
@@ -748,14 +1097,14 @@ for k in "${K_VALUES[@]}"; do
         block_counts_per_fs=$(cat "$RUN_DIR/block_counts_tmp.txt")
         # Remove trailing semicolon if present
         block_counts_per_fs="${block_counts_per_fs%;}"
-        rm -f "$RUN_DIR/block_counts_tmp.txt"
     fi
+    rm -f "$RUN_DIR/block_counts_tmp.txt"
     log "Block counts collected: $block_counts_per_fs"
 
     # Collect per-filesystem used capacity in MB
     log "Collecting per-filesystem used capacity..."
     fs_used_mb_per_fs=""
-    > "$RUN_DIR/fs_used_mb_tmp.txt"
+    : > "$RUN_DIR/fs_used_mb_tmp.txt"
     for NODE in "${DATANODE_NODES[@]}"; do
         # Get used space (in MB) for each loopback filesystem mount point
         ssh "$NODE" "for i in {1..$k}; do
@@ -767,15 +1116,15 @@ for k in "${K_VALUES[@]}"; do
         fs_used_mb_per_fs=$(cat "$RUN_DIR/fs_used_mb_tmp.txt")
         # Remove trailing semicolon if present
         fs_used_mb_per_fs="${fs_used_mb_per_fs%;}"
-        rm -f "$RUN_DIR/fs_used_mb_tmp.txt"
     fi
+    rm -f "$RUN_DIR/fs_used_mb_tmp.txt"
     log "Filesystem capacity collected: $fs_used_mb_per_fs"
 
 
     # Collect HDFS block information specifically for INPUT FILES
     log "Collecting HDFS block information for input files..."
     HDFS_FSCK_OUTPUT="$RUN_DIR/hdfs_fsck_k${k}.txt"
-    hdfs fsck /user/$USER/wordcount/input -files -blocks -locations > "$HDFS_FSCK_OUTPUT" 2>&1
+    hdfs fsck /user/$USER/wordcount/input -files -blocks -locations > "$HDFS_FSCK_OUTPUT" 2>&1 || true
     log "HDFS input block information saved to: $HDFS_FSCK_OUTPUT"
 
     # Extract input block IDs from FSCK output
@@ -796,7 +1145,7 @@ for k in "${K_VALUES[@]}"; do
     # Count input blocks per loopback filesystem (using helper script)
     log "Counting input blocks per loopback filesystem..."
     input_block_counts_per_fs=""
-    > "$RUN_DIR/input_block_counts_tmp.txt"
+    : > "$RUN_DIR/input_block_counts_tmp.txt"
     for NODE in "${DATANODE_NODES[@]}"; do
         # Copy block IDs file and helper script to remote node
         scp -q "$INPUT_BLOCK_IDS" "$NODE:/tmp/input_block_ids_k${k}.txt" 2>/dev/null || true
@@ -813,8 +1162,8 @@ for k in "${K_VALUES[@]}"; do
         input_block_counts_per_fs=$(cat "$RUN_DIR/input_block_counts_tmp.txt")
         # Remove trailing semicolon
         input_block_counts_per_fs="${input_block_counts_per_fs%;}"
-        rm -f "$RUN_DIR/input_block_counts_tmp.txt"
     fi
+    rm -f "$RUN_DIR/input_block_counts_tmp.txt"
     log "Input block counts per FS: $input_block_counts_per_fs"
 
     # Parse FSCK to extract input file block distribution summary
@@ -822,7 +1171,7 @@ for k in "${K_VALUES[@]}"; do
     INPUT_BLOCK_OUTPUT="$RUN_DIR/input_block_dist_k${k}.txt"
     # Use an unquoted heredoc so shell variables expand into the Python script.
     # The Python analyzer will catch exceptions and exit 0 so the main script continues.
-    python3 > "$INPUT_BLOCK_OUTPUT" 2>&1 <<PARSE_BLOCKS
+    python3 > "$INPUT_BLOCK_OUTPUT" 2>&1 <<PARSE_BLOCKS || true
 import re
 import sys
 from collections import defaultdict
@@ -899,16 +1248,21 @@ except Exception as e:
     sys.exit(0)
 PARSE_BLOCKS
 
-    # Record to CSV (runtime + NameNode memory columns + per-FS block counts + input block counts + FS capacity)
-    echo "$k,$TOTAL_STORAGE_DIRS,$LIVE_DNS,$avg,$stddev,$individual,$NN_HEAP_BEFORE,$NN_HEAP_PEAK,$NN_HEAP_AVG,$NN_BLOCK_COUNT,$block_counts_per_fs,$input_block_counts_per_fs,$fs_used_mb_per_fs" >> "$CSV_FILE"
+    # -- Step 5: Record per-k results (runtime + NameNode memory + block/FS stats) --
+    log ""
+    log "  k=$k  NN: heap_before=${NN_HEAP_BEFORE}MB peak=${NN_HEAP_PEAK}MB avg=${NN_HEAP_AVG}MB blocks=$NN_BLOCK_COUNT"
+    write_results_row 0 "$CSV_FILE"
+    if (( NUM_CONDITIONS > 1 )); then
+        for ((ci=0; ci<NUM_CONDITIONS; ci++)); do
+            write_results_row "$ci" "$RUN_DIR/results_${COND_NAMES[$ci]}.csv"
+        done
+    fi
 
-    unset runtimes
-
-    # -- Step 5: Clean up HDFS data (output already removed above; this clears input too) --
+    # -- Step 6: Clean up HDFS data (output already removed above; this clears input too) --
     log "Cleaning HDFS data..."
     hdfs dfs -rm -r -f /user/$USER/wordcount 2>/dev/null || true
 
-    # -- Step 6: Stop the cluster and tear down loopback FSes --
+    # -- Step 7: Stop the cluster and tear down loopback FSes --
     log "Stopping cluster..."
     bash "$SCRIPT_DIR/stop-single-dn-cluster.sh" "$k" 2>&1 | tee -a "$LOG_FILE"
 
@@ -919,62 +1273,59 @@ done
 # ============================================================================
 # RESTORE NORMAL CLUSTER
 # ============================================================================
-log ""
-log "============================================================"
-log "Restoring normal single-DataNode cluster..."
-log "============================================================"
+if [[ "$RESTORE_BASE_CLUSTER" == "1" ]]; then
+    log ""
+    log "============================================================"
+    log "Restoring normal single-DataNode cluster..."
+    log "============================================================"
 
-unset HADOOP_CONF_DIR
+    unset HADOOP_CONF_DIR
 
-rm -rf "${HADOOP_DATA_DIR}/namenode/current" 2>/dev/null || true
-rm -rf "${HADOOP_DATA_DIR}/datanode/current" 2>/dev/null || true
-for node in "${ALL_NODES[@]}"; do
-    if [[ "$node" != "$(hostname)" && "$node" != "$MASTER_NODE" ]]; then
-        ssh "$node" "rm -rf ${HADOOP_DATA_DIR}/datanode/current" 2>/dev/null || true
-    fi
-done
+    rm -rf "${HADOOP_DATA_DIR}/namenode/current" 2>/dev/null || true
+    rm -rf "${HADOOP_DATA_DIR}/datanode/current" 2>/dev/null || true
+    for node in "${ALL_NODES[@]}"; do
+        if [[ "$node" != "$(hostname)" && "$node" != "$MASTER_NODE" ]]; then
+            ssh "$node" "rm -rf ${HADOOP_DATA_DIR}/datanode/current" 2>/dev/null || true
+        fi
+    done
 
-hdfs namenode -format -force -nonInteractive > /dev/null 2>&1
-start-dfs.sh > /dev/null 2>&1
-start-yarn.sh > /dev/null 2>&1
-sleep 10
+    hdfs namenode -format -force -nonInteractive > /dev/null 2>&1 || true
+    start-dfs.sh > /dev/null 2>&1 || true
+    start-yarn.sh > /dev/null 2>&1 || true
+    sleep 10
 
-log "Normal cluster restored."
+    log "Normal cluster restored."
+fi
 
 # ============================================================================
 # SUMMARY
 # ============================================================================
+ln -sfn "$RUN_DIR" "$RESULTS_BASE/latest"
+
+python3 - "$RUN_DIR/metadata.json" "$(date -Iseconds)" "$FAILED_JOBS" <<'PY' 2>/dev/null || true
+import json, sys
+path, end_time, failed = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(path) as f:
+    meta = json.load(f)
+meta["end_time"] = end_time
+meta["failed_jobs"] = failed
+with open(path, "w") as f:
+    json.dump(meta, f, indent=4)
+PY
+
+python3 "$SCRIPT_DIR/summarize-runs.py" "$RUN_DIR" 2>&1 | tee "$RUN_DIR/summary.txt" || true
+
 echo ""
 echo "============================================================"
-echo "Experiment Complete!"
+echo "Experiment Complete!  ($FAILED_JOBS failed jobs)"
 echo "============================================================"
 echo ""
 echo "Results saved to: $RUN_DIR"
-echo ""
-echo "Files:"
-echo "  - results.csv                     : Main results (runtime + NN memory)"
-echo "  - metadata.json                   : Experiment configuration"
-echo "  - experiment.log                  : Detailed log"
-echo "  - namenode_memory/nn_memory_k*.csv : Per-k NameNode memory time series"
-echo "  - iostat/iostat_k*_*.log           : Per-k per-node raw iostat logs"
-echo "  - iostat/iostat_summary_k*.csv     : Per-k parsed iostat summaries"
-echo ""
-echo "CSV preview:"
-column -t -s, "$CSV_FILE" 2>/dev/null || cat "$CSV_FILE"
+echo "  - summary.txt / runs.csv          : per-job results and the comparison table"
+echo "  - results.csv                     : per-k summary (input of plot-results.py)"
+echo "  - metadata.json, configs/, jobs/  : settings, Hadoop configs, job output"
+echo "  - namenode_memory/, iostat/, sysstat/ : monitors"
 echo ""
 echo "Generate plots with:"
 echo "  python3 $SCRIPT_DIR/plot-results.py $RUN_DIR"
 echo "============================================================"
-
-# Create symlink to latest run
-ln -sfn "$RUN_DIR" "$RESULTS_BASE/latest"
-
-# Update metadata with end time
-python3 -c "
-import json, sys
-with open('$RUN_DIR/metadata.json', 'r') as f:
-    meta = json.load(f)
-meta['end_time'] = '$(date -Iseconds)'
-with open('$RUN_DIR/metadata.json', 'w') as f:
-    json.dump(meta, f, indent=4)
-" 2>/dev/null || true

@@ -17,6 +17,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export CLUSTER=tapuz
 source "$SCRIPT_DIR/cluster.conf"
 
 echo "============================================================"

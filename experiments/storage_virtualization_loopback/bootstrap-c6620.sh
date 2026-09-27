@@ -8,7 +8,7 @@
 #              - Reports what is still missing (Hadoop, Java) so you can
 #                install those once and rsync to all workers.
 #
-# RUN ON: master node (er101). Will SSH to all peers.
+# RUN ON: master node (node0). Will SSH to all peers.
 #
 # USAGE: bash bootstrap-c6620.sh
 ################################################################################
@@ -16,6 +16,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export CLUSTER=c6620
 source "$SCRIPT_DIR/cluster.conf"
 
 echo "============================================================"
