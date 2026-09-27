@@ -1,0 +1,12 @@
+# Local tool settings (machine-specific)
+.claude/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Java build output
+target/
+
+# Experiment results are copied back to the laptop, not versioned
+results/

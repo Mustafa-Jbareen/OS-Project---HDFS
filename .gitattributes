@@ -1,0 +1,10 @@
+# Scripts run on Linux (tapuz / CloudLab): always check out with LF endings,
+# even on Windows with core.autocrlf=true. CRLF breaks bash ($'\r' errors).
+* text=auto eol=lf
+
+*.png  binary
+*.pdf  binary
+*.jar  binary
+*.zip  binary
+*.gz   binary
+*.pyc  binary
