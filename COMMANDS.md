@@ -1,0 +1,165 @@
+# Commands: the k-virtual-disks experiment
+
+Every command, in the order you use them.
+
+- **LOCAL** = this laptop (Windows), in **PowerShell** (the VS Code terminal).
+- **TAPUZ** = tapuz14 (Linux). Log in from PowerShell with
+  `ssh mostufa.j@tapuz14.cslcs.technion.ac.il`.
+
+On Tapuz `~` is the shared `/csl` home, so every Tapuz path here is spelled
+out under `/home/mostufa.j`. What each stage runs, and with which settings, is
+in [PROJECT_NOTES.md](PROJECT_NOTES.md#experiment-parameters).
+
+## 1. Once per laptop: ssh key
+
+LOCAL (asks the Tapuz password one last time):
+
+```powershell
+Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub | ssh mostufa.j@tapuz14.cslcs.technion.ac.il "mkdir -p /home/mostufa.j/.ssh && chmod 700 /home/mostufa.j/.ssh && tr -d '\r' >> /home/mostufa.j/.ssh/authorized_keys && chmod 600 /home/mostufa.j/.ssh/authorized_keys"
+ssh mostufa.j@tapuz14.cslcs.technion.ac.il hostname
+```
+
+The second line should print `tapuz14` without asking for a password. Without
+the key everything still works; ssh just asks for the password each time.
+
+## 2. Send the code (after every change)
+
+LOCAL:
+
+```powershell
+cd C:\Users\mostufa.j\Desktop\Dan\hadoop\my_scripts
+.\sync-cluster.ps1 push
+```
+
+Afterwards `/home/mostufa.j/my_scripts` on tapuz14 matches this folder, with
+Linux line endings. Files deleted here are deleted there, and `results/` is
+never touched. Push refuses while an experiment is running.
+
+## 3. Before a run: clean and check the nodes
+
+TAPUZ:
+
+```bash
+cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
+bash clean-scratch.sh
+bash bootstrap-tapuz.sh
+```
+
+- `clean-scratch.sh` stops Hadoop, removes the loopback disks, and deletes
+  your own leftovers in `/scratch` on all 5 nodes. It prints the free space
+  before and after.
+- In the `bootstrap-tapuz.sh` output, no line may say MISSING or FAIL. Every
+  node should show `page cache: ok (64 MB test file: 64 MB in RAM after
+  reading, 0 MB after evicting)`. Each worker needs at least 205 GB free on
+  `/scratch` and 0 loopback mounts.
+
+## 4. Run everything
+
+TAPUZ:
+
+```bash
+screen -S exp
+cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
+bash run-all.sh                  # ~13 h; "bash run-all.sh --reps 3" takes ~9 h
+```
+
+Press **Ctrl+A, then D** to detach. The run keeps going, and you can log out.
+
+The first ~35 minutes are the smoke test, which ends with **READY** or **NOT
+READY**. NOT READY stops the pipeline and prints the failed checks.
+
+## 5. Reconnect to the run
+
+LOCAL:
+
+```powershell
+ssh mostufa.j@tapuz14.cslcs.technion.ac.il
+```
+
+TAPUZ:
+
+```bash
+screen -r exp                    # back into the running experiment
+screen -ls                       # list the sessions, if "screen -r" finds none
+screen -d -r exp                 # if it says "Attached" (an old connection still holds it)
+```
+
+To leave again: **Ctrl+A, then D**. Don't press Ctrl+C in there unless you
+want to stop the run.
+
+To watch without entering screen:
+
+```bash
+tail -f /home/mostufa.j/my_scripts/results/pipeline_latest/pipeline.log      # Ctrl+C stops only tail
+cat /home/mostufa.j/my_scripts/results/pipeline_latest/stages.env             # stages done so far
+cat /home/mostufa.j/my_scripts/results/pipeline_latest/1_smoke/run_*/checks.txt   # smoke test result
+```
+
+## 6. Stop early, continue later
+
+TAPUZ:
+
+```bash
+screen -r exp                    # then press Ctrl+C
+cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
+bash stop-single-dn-cluster.sh 1024
+```
+
+Later, still in that folder (inside `screen -S exp`):
+
+```bash
+bash run-all.sh --from 2         # continue the latest pipeline at a stage (here 2)
+bash run-all.sh --only 3         # or run a single stage
+```
+
+## 7. Get the results
+
+LOCAL:
+
+```powershell
+cd C:\Users\mostufa.j\Desktop\Dan\hadoop\my_scripts
+.\sync-cluster.ps1 pull
+```
+
+This copies the results to `hadoop\pipeline_<date>\` and writes
+`FINAL_REPORT.md` there, with the figures in `figures\`. It also works during
+a run, as a snapshot.
+
+For a single run folder instead of a pipeline:
+
+```powershell
+python experiments\storage_virtualization_loopback\final-report.py ..\storage_virtualization_loopback_tapuz\run_<date>
+```
+
+## 8. Single runs instead of the pipeline
+
+TAPUZ, in the experiment folder, inside screen:
+
+```bash
+bash run-2x2.sh smoke                    # small 2x2, ~35 min, ends with READY / NOT READY
+bash run-2x2.sh                          # full 2x2: k = 1 64 256 512 1024, 5 repetitions
+bash storage-bench.sh                    # the storage stack alone, no Hadoop
+K_VALUES="1 1024" bash run-2x2.sh 3      # any setting can be overridden like this
+```
+
+## CloudLab (when reserved)
+
+On CloudLab `~` is the normal home. LOCAL:
+
+```powershell
+.\sync-cluster.ps1 push Mostufa@<node0 public name> -RemoteDir '~/my_scripts'
+.\sync-cluster.ps1 pull Mostufa@<node0 public name> -RemoteDir '~/my_scripts'
+```
+
+On node0, run `bash bootstrap-c6620.sh` once. After that, use the same
+commands as on Tapuz, from `~/my_scripts/experiments/storage_virtualization_loopback`.
+
+## If something goes wrong
+
+| What you see | What to do |
+|---|---|
+| push says "An experiment is running" | wait for it to finish, or stop it (section 6) |
+| ssh asks for a password | install the key (section 1), or type it |
+| the smoke test says NOT READY | send the FAIL lines from `1_smoke/run_*/checks.txt` |
+| `page cache: FAIL` in bootstrap | send that line; don't start the run |
+| your normal Hadoop cluster is down | expected during a run; `run-all.sh` restarts it at the end, with an empty (reformatted) HDFS |

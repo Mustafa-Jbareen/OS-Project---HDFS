@@ -2,6 +2,11 @@
 
 A comprehensive toolkit for setting up, managing, and benchmarking a multi-node Hadoop HDFS/YARN cluster, plus in-JVM MiniDFSCluster experiments for NameNode memory scaling research.
 
+**Current work (k virtual disks, September 2026):** every command, laptop and
+Tapuz, is in [COMMANDS.md](COMMANDS.md). Where the project stands, the
+experiment parameters and what we know about the machines are in
+[PROJECT_NOTES.md](PROJECT_NOTES.md).
+
 ---
 
 ## Table of Contents
