@@ -386,7 +386,7 @@ Results so far: [FINDINGS.md](experiments/storage_virtualization_loopback/FINDIN
 
 ```bash
 # tapuz14 (inside screen): the cluster is picked from the hostname (CLUSTER=tapuz|c6620)
-cd ~/my_scripts/experiments/storage_virtualization_loopback
+cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
 bash run-all.sh      # smoke test (gate) -> main run -> storage benchmark -> controls -> FINAL_REPORT.md (~13 h)
 K_VALUES="1 16 128 512 1024" bash run-experiment-loopback-fs.sh 5   # k sweep
 ```

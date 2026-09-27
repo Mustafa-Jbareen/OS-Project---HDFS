@@ -16,30 +16,31 @@ only edits code and looks at results.
 
 **LOCAL** = the laptop (Windows), in **PowerShell** (the VS Code terminal).
 **TAPUZ** = tapuz14 (Linux); log in from PowerShell with
-`ssh mostufa.j@tapuz14.cslcs.technion.ac.il`.
+`ssh mostufa.j@tapuz14.cslcs.technion.ac.il`. On Tapuz `~` is the shared
+`/csl` home, so every Tapuz path here is spelled out under `/home/mostufa.j`.
 
 1. LOCAL, once -- install the laptop's ssh key (asks the Tapuz password one
-   last time; the home folder is shared by all tapuz nodes):
+   last time):
    ```powershell
-   Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub | ssh mostufa.j@tapuz14.cslcs.technion.ac.il "mkdir -p ~/.ssh && chmod 700 ~/.ssh && tr -d '\r' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+   Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub | ssh mostufa.j@tapuz14.cslcs.technion.ac.il "mkdir -p /home/mostufa.j/.ssh && chmod 700 /home/mostufa.j/.ssh && tr -d '\r' >> /home/mostufa.j/.ssh/authorized_keys && chmod 600 /home/mostufa.j/.ssh/authorized_keys"
    ssh mostufa.j@tapuz14.cslcs.technion.ac.il hostname      # prints tapuz14, no password
    ```
 2. TAPUZ, once -- put the old copy aside (nothing is deleted, old results included):
    ```bash
-   mv ~/my_scripts ~/my_scripts_before_sep2026
+   mv /home/mostufa.j/my_scripts /home/mostufa.j/my_scripts_before_sep2026
    ```
 3. LOCAL -- send the code (again after every change):
    ```powershell
    cd C:\Users\mostufa.j\Desktop\Dan\hadoop\my_scripts
    .\sync-cluster.ps1 push
    ```
-   Afterwards `~/my_scripts` on tapuz14 matches the laptop folder, with Linux
-   line endings. Its `VERSION` file records the commit; the version ends in
-   `-dirty` when there are uncommitted changes. Push refuses while an
-   experiment is running.
+   Afterwards `/home/mostufa.j/my_scripts` on tapuz14 matches the laptop
+   folder, with Linux line endings. Its `VERSION` file records the commit;
+   the version ends in `-dirty` when there are uncommitted changes. Push
+   refuses while an experiment is running.
 4. TAPUZ, once -- clean the nodes and check them:
    ```bash
-   cd ~/my_scripts/experiments/storage_virtualization_loopback
+   cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
    bash stop-single-dn-cluster.sh 1024       # stop Hadoop, remove loopback disks on tapuz10-13
    bash bootstrap-tapuz.sh                   # ssh, sudo, tools, free space and loop mounts per node
    ```
@@ -48,11 +49,11 @@ only edits code and looks at results.
 5. TAPUZ -- run everything (inside screen, so it survives logging out):
    ```bash
    screen -S exp
-   cd ~/my_scripts/experiments/storage_virtualization_loopback
+   cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
    bash run-all.sh                           # --reps 3 for ~9 h instead of ~13 h
    ```
    Detach with Ctrl+A then D; `screen -r exp` to come back;
-   `tail -f ~/my_scripts/results/pipeline_latest/pipeline.log` to watch.
+   `tail -f /home/mostufa.j/my_scripts/results/pipeline_latest/pipeline.log` to watch.
 6. LOCAL -- when it is done:
    ```powershell
    cd C:\Users\mostufa.j\Desktop\Dan\hadoop\my_scripts
@@ -68,7 +69,7 @@ To stop a run (TAPUZ): `screen -r exp`, Ctrl+C, then
 ## Everything in one command: `run-all.sh`
 
 ```bash
-cd ~/my_scripts/experiments/storage_virtualization_loopback
+cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
 screen -S exp                         # survives disconnects: Ctrl+A D, later screen -r exp
 bash run-all.sh                       # ~13 h on tapuz (--reps 3: ~9 h)
 ```
@@ -86,7 +87,7 @@ bash run-all.sh                       # ~13 h on tapuz (--reps 3: ~9 h)
 Everything goes to `results/pipeline_<timestamp>/` (`pipeline_latest` points
 to it): one folder per stage, `pipeline.log`, `stages.env`, `FINAL_REPORT.md`.
 `bash run-all.sh --from N` continues the latest pipeline at stage N;
-`--only N` runs one stage. Follow it with `tail -f ~/my_scripts/results/pipeline_latest/pipeline.log`.
+`--only N` runs one stage. Follow it with `tail -f /home/mostufa.j/my_scripts/results/pipeline_latest/pipeline.log`.
 
 On the laptop (PowerShell), `.\sync-cluster.ps1 pull` copies the pipeline
 folder and writes the report again there, with the figures (matplotlib).
@@ -96,13 +97,13 @@ folder and writes the report again there, with the figures (matplotlib).
 On the laptop, in PowerShell, from `my_scripts\`:
 
 ```powershell
-.\sync-cluster.ps1 push               # code -> tapuz14:~/my_scripts (commit first for a clean VERSION)
+.\sync-cluster.ps1 push               # code -> tapuz14:/home/mostufa.j/my_scripts (commit first for a clean VERSION)
 ```
 
 On tapuz14:
 
 ```bash
-cd ~/my_scripts/experiments/storage_virtualization_loopback
+cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
 bash run-2x2.sh smoke                 # small 2x2; ends with READY / NOT READY
 bash run-2x2.sh                       # full 2x2: k = 1 64 256 512 1024
 bash storage-bench.sh                 # storage stack alone
@@ -122,10 +123,12 @@ so a CloudLab run differs from a Tapuz run only in hardware.
 1. On a new reservation, update the node names in `clusters/c6620.conf` if they
    differ, then run `bash bootstrap-c6620.sh` once on node0 (symlinks
    `/scratch -> /mydata`, installs sysstat for iostat/pidstat/mpstat).
-2. Push from the laptop (PowerShell): `.\sync-cluster.ps1 push Mostufa@<node0 public name>`.
+2. Push from the laptop (PowerShell):
+   `.\sync-cluster.ps1 push Mostufa@<node0 public name> -RemoteDir '~/my_scripts'`
+   (the normal home on CloudLab, unlike Tapuz).
 3. On node0 the cluster is detected from the hostname (`CLUSTER=c6620`); run
-   the same commands as on Tapuz (smoke test first).
-4. Pull: `.\sync-cluster.ps1 pull Mostufa@<node0 public name>`.
+   the same commands as on Tapuz (smoke test first), in `~/my_scripts`.
+4. Pull: `.\sync-cluster.ps1 pull Mostufa@<node0 public name> -RemoteDir '~/my_scripts'`.
 
 Use the internal names (node0..node4) inside the cluster, never the public
 er###.utah.cloudlab.us names (CloudLab rate-limits the control network).

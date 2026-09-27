@@ -5,27 +5,31 @@ It uses the ssh and tar that come with Windows 10/11 and asks for the password
 once per call unless an ssh key is installed.
 
 USAGE
-  .\sync-cluster.ps1 push [user@host]
-      Makes ~/my_scripts on the host match this folder: every file git knows
-      about (committed or not, new files too; ignored files are skipped), with
-      Linux line endings, plus a VERSION file with the commit id. Files deleted
-      here since the last push are deleted there; results/ is never touched.
-      Refuses while an experiment is running on the host.
+  .\sync-cluster.ps1 push [user@host] [-RemoteDir <folder>]
+      Makes the folder on the host (default /home/mostufa.j/my_scripts) match
+      this folder: every file git knows about (committed or not, new files
+      too; ignored files are skipped), with Linux line endings, plus a VERSION
+      file with the commit id. Files deleted here since the last push are
+      deleted there; results/ is never touched. Refuses while an experiment
+      is running on the host.
 
-  .\sync-cluster.ps1 pull [user@host] ['patterns']
-      Copies ~/my_scripts/results/<patterns> (default: 'pipeline_2*
+  .\sync-cluster.ps1 pull [user@host] ['patterns'] [-RemoteDir <folder>] [-ResultsDir <folder>]
+      Copies <RemoteDir>/results/<patterns> (default patterns: 'pipeline_2*
       storage_virtualization_loopback_* storage_bench_*') into the folder that
       holds my_scripts (hadoop\), then writes FINAL_REPORT.md with the figures
-      for the newest pipeline_* folder it copied. To pull from another folder
-      on the host, first set:  $env:REMOTE_RESULTS = '/scratch/results'
+      for the newest pipeline_* folder it copied. -ResultsDir pulls from
+      another folder on the host instead of <RemoteDir>/results.
 
-  user@host defaults to mostufa.j@tapuz14.cslcs.technion.ac.il.
-  CloudLab example: .\sync-cluster.ps1 push Mostufa@er101.utah.cloudlab.us
+  user@host defaults to mostufa.j@tapuz14.cslcs.technion.ac.il. On Tapuz ~ is
+  the shared /csl home, so the default folder is spelled out.
+  CloudLab example: .\sync-cluster.ps1 push Mostufa@er101.utah.cloudlab.us -RemoteDir '~/my_scripts'
 #>
 param(
     [Parameter(Position = 0)][string]$Action = '',
     [Parameter(Position = 1)][string]$Target = 'mostufa.j@tapuz14.cslcs.technion.ac.il',
-    [Parameter(Position = 2)][string]$Patterns = 'pipeline_2* storage_virtualization_loopback_* storage_bench_*'
+    [Parameter(Position = 2)][string]$Patterns = 'pipeline_2* storage_virtualization_loopback_* storage_bench_*',
+    [string]$RemoteDir = '/home/mostufa.j/my_scripts',
+    [string]$ResultsDir = ''
 )
 
 Set-StrictMode -Version 2
@@ -35,11 +39,15 @@ $RepoDir = $PSScriptRoot
 $Tar = Join-Path $env:SystemRoot 'System32\tar.exe'   # bsdtar; understands C:\ paths
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 
-# Runs on the host (bash) with the archive on stdin.
+# Runs on the host (bash) with the archive on stdin; $1 = destination folder.
 $PushScript = @'
 set -eu
 export LC_ALL=C
-dest="$HOME/my_scripts"
+dest=$1
+case "$dest" in
+    \~) dest=$HOME ;;
+    \~/*) dest="$HOME/${dest#\~/}" ;;
+esac
 busy='bash .*(run-all|run-2x2|run-experiment-loopback-fs|storage-bench)\.sh'
 if command -v pgrep >/dev/null 2>&1 && pgrep -u "$(id -u)" -f "$busy" >/dev/null; then
     {
@@ -74,7 +82,8 @@ echo "  $(grep -c . .sync-manifest) files in $dest, version $(cut -d' ' -f1 VERS
 if [ "$removed" -gt 0 ]; then echo "  removed $removed file(s) that were deleted on the laptop"; fi
 '@
 
-# Runs on the host (bash); writes the archive to stdout, messages to stderr.
+# Runs on the host (bash); $1 = results folder, then the patterns. Writes the
+# archive to stdout, messages to stderr.
 $PullScript = @'
 set -eu
 dir=$1
@@ -140,6 +149,11 @@ function Invoke-Remote([string]$Script, [string[]]$Arguments = @(), [string]$Std
     return $proc.ExitCode
 }
 
+# Folder names and patterns go to the host inside single quotes.
+function Assert-RemoteName([string]$Name) {
+    if ($Name -notmatch '^[A-Za-z0-9_.*?/~\[\]-]+$') { throw "Unsupported characters in '$Name'." }
+}
+
 function Write-Failure([int]$Code, [string]$What) {
     if ($Code -eq 255) {
         Write-Host "ssh could not connect or log in to $Target (exit 255)." -ForegroundColor Red
@@ -149,6 +163,7 @@ function Write-Failure([int]$Code, [string]$What) {
 }
 
 function Invoke-Push {
+    Assert-RemoteName $RemoteDir
     $entries = @(& git -C $RepoDir -c core.quotepath=off ls-files --eol --cached --others --exclude-standard)
     if ($LASTEXITCODE -ne 0) { throw "git ls-files failed in $RepoDir" }
     $version = (& git -C $RepoDir rev-parse --short HEAD | Out-String).Trim()
@@ -196,8 +211,8 @@ function Invoke-Push {
             Write-Host "Sent with Linux line endings (they have Windows ones here): $($converted -join ', ')"
         }
         $mb = (Get-Item -LiteralPath $tgz).Length / 1MB
-        Write-Host ('Pushing {0} files ({1:N1} MB) to {2}:~/my_scripts ...' -f $files.Count, $mb, $Target)
-        $rc = Invoke-Remote -Script $PushScript -StdIn $tgz
+        Write-Host ('Pushing {0} files ({1:N1} MB) to {2}:{3} ...' -f $files.Count, $mb, $Target, $RemoteDir)
+        $rc = Invoke-Remote -Script $PushScript -Arguments @($RemoteDir) -StdIn $tgz
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -234,11 +249,9 @@ function Write-Report([string]$PipeDir) {
 
 function Invoke-Pull {
     $patternList = @($Patterns -split '\s+' | Where-Object { $_ })
-    $remoteDir = '~/my_scripts/results'
-    if ($env:REMOTE_RESULTS) { $remoteDir = $env:REMOTE_RESULTS }
-    foreach ($p in @($remoteDir) + $patternList) {
-        if ($p -notmatch '^[A-Za-z0-9_.*?/~\[\]-]+$') { throw "Unsupported characters in '$p'." }
-    }
+    $remoteDir = $RemoteDir.TrimEnd('/') + '/results'
+    if ($ResultsDir) { $remoteDir = $ResultsDir }
+    foreach ($p in @($remoteDir) + $patternList) { Assert-RemoteName $p }
     $dest = Split-Path -Parent $RepoDir
     $work = New-WorkDir
     $top = @()

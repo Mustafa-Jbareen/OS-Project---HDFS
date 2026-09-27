@@ -77,8 +77,8 @@ for node in "${ALL_NODES[@]}"; do
     fi
 done
 if [[ "$SSH_OK" != "1" ]]; then
-    echo "  Fix SSH first. NFS-shared \$HOME means adding pubkey to"
-    echo "  ~/.ssh/authorized_keys on tapuz14 propagates to every node."
+    echo "  Fix SSH first: each node reads its keys from /home/mostufa.j/.ssh"
+    echo "  (not the shared ~); setup-ssh.sh in my_scripts installs them."
 fi
 
 # ---- Step 3: report tooling presence ---------------------------------------
