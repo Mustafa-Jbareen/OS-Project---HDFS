@@ -43,6 +43,8 @@ COUNTERS = {
 OLD_JOB = re.compile(r"Run \d+/\d+ \(k=(\d+)\)")
 # "  Rep 2/5  k=512  condition=maps8_cold"   (current runner)
 NEW_JOB = re.compile(r"Rep \d+/\d+\s+k=(\d+)\s+condition=(\S+)")
+# "  Warm-up job 1/1  k=512  (not measured; ...)" -- skipped
+WARMUP = re.compile(r"Warm-up job \d+/\d+")
 RUNTIME = re.compile(r"Runtime: ([\d.]+)s")
 
 
@@ -77,6 +79,9 @@ def parse_experiment_log(path):
             m = OLD_JOB.search(line)
             if m:
                 k, condition, current = int(m.group(1)), "-", {}
+                continue
+            if WARMUP.search(line):
+                k, current = None, {}
                 continue
             parse_counter_line(line, current)
             m = RUNTIME.search(line)

@@ -87,12 +87,15 @@ NameNode.
 
 ## 5. Next steps
 
-1. **The 2x2 test on Tapuz** (`run-2x2.sh`): load (1 vs 8 maps per node) x
-   cache (cold vs warm) at k=1 and k=1024, interleaved on one cluster. If load
-   is the cause, the 8-maps cells show roughly +10% at k=1024 and the 1-map
-   cells show little, cold or warm.
-2. Repeat it on c6620 when a reservation is available (warm runs are clean
-   there: plenty of RAM).
+1. **The 2x2 test on Tapuz**: first `run-2x2.sh smoke` (~25 min, checks that
+   every part works), then `run-2x2.sh`: load (1 vs 8 maps per node) x cache
+   (cold vs warm) at k = 1, 64, 256, 512, 1024, conditions interleaved on one
+   cluster through an identical per-job protocol. If load is the cause, the
+   8-maps cells show roughly +10% at k=1024 and the 1-map cells show little,
+   cold or warm.
+2. Repeat it on c6620 when a reservation is available, with the same settings
+   (they are shared by all clusters now), so only the hardware differs. Warm
+   runs are clean there (plenty of RAM).
 3. Where the time goes: `sysstat/` now records DataNode CPU and node
    %usr/%sys/%iowait per k. Candidates: per-volume DataNode threads and locks,
    one loop device + ext4 journal per virtual disk (kernel threads), double

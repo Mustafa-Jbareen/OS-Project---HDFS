@@ -81,7 +81,8 @@ my_scripts/
 │   │
 │   ├── storage_virtualization_loopback/   # Storage virtualization (loopback FS) experiment — see Experiment 5
 │   │   ├── README.md, FINDINGS.md         # How to run it / what the data shows so far
-│   │   ├── cluster.conf, clusters/*.conf  # Cluster selection (tapuz, c6620): nodes, paths, defaults
+│   │   ├── experiment.conf                # Measured settings, the same on every cluster
+│   │   ├── cluster.conf, clusters/*.conf  # Cluster selection (tapuz, c6620): node names, paths
 │   │   ├── run-experiment-loopback-fs.sh  # Main orchestrator
 │   │   ├── run-2x2.sh                     # Load x page-cache test at k=1 and k=1024
 │   │   ├── summarize-runs.py              # Comparison table (with 95% CIs) from runs.csv
@@ -331,7 +332,7 @@ python3 experiments/mini_dfs_cluster/plot_fixed_blocks.py \
 | k values | `K_VALUES` (default 1, 256, 1024; April 2026 sweeps used 1..1024) |
 | Input | `INPUT_SIZE_GB` (default 8 GB), `BLOCK_SIZE_MB` (default 32 MB), replication = 3 |
 | Repetitions | 5 per k and condition |
-| YARN pool | tapuz 8 x 2 GB per node, c6620 52 x 1 GB (`SLOTS_PER_NODE`, `CONTAINER_MB`) |
+| YARN pool | 8 x 2 GB per node on every cluster (`SLOTS_PER_NODE`, `CONTAINER_MB` in `experiment.conf`) |
 | DataNode heap | 5 500 MB / node |
 | Loopback budget | 200 GB / node |
 
@@ -384,7 +385,8 @@ bash sync-cluster.sh push
 
 # tapuz14 (inside screen): the cluster is picked from the hostname (CLUSTER=tapuz|c6620)
 cd ~/my_scripts/experiments/storage_virtualization_loopback
-bash run-2x2.sh                                              # load x cache test
+bash run-2x2.sh smoke                                        # tiny 2x2 with READY / NOT READY checks (~25 min)
+bash run-2x2.sh                                              # full load x cache test (~7-8 h)
 K_VALUES="1 16 128 512 1024" bash run-experiment-loopback-fs.sh 5   # k sweep
 
 # laptop: fetch results and plot

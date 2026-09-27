@@ -303,6 +303,18 @@ cat > "$CONFIG_DIR/mapred-site.xml" <<EOF
     <name>yarn.app.mapreduce.am.command-opts</name>
     <value>-Xmx${TASK_HEAP_MB}m</value>
   </property>
+
+  <!-- No speculative (duplicate) task attempts. Hadoop launches them for
+       slow tasks, so how many run depends on the load; they add reads and
+       work that would differ between the conditions being compared. -->
+  <property>
+    <name>mapreduce.map.speculative</name>
+    <value>false</value>
+  </property>
+  <property>
+    <name>mapreduce.reduce.speculative</name>
+    <value>false</value>
+  </property>
 </configuration>
 EOF
 
