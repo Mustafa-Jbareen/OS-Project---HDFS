@@ -1,3 +1,11 @@
+> **Update (Sep 2026):** the experiment settings no longer live in
+> `run-experiment-loopback-fs.sh`. Cluster defaults are in
+> `experiments/storage_virtualization_loopback/clusters/*.conf` and every one
+> can be overridden with an environment variable, e.g.
+> `LOOPBACK_BUDGET_PER_NODE_GB=30 K_VALUES="1 8 64" bash run-experiment-loopback-fs.sh`.
+> For the c6620 nodes see `experiments/storage_virtualization_loopback/README.md`.
+> The m400 notes below are kept for reference.
+
 CloudLab setup notes for running the storage-virtualization experiment
 ============================================================
 

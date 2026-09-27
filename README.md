@@ -80,7 +80,12 @@ my_scripts/
 │   │   └── requirements.txt              # Python dependencies
 │   │
 │   ├── storage_virtualization_loopback/   # Storage virtualization (loopback FS) experiment — see Experiment 5
+│   │   ├── README.md, FINDINGS.md         # How to run it / what the data shows so far
+│   │   ├── cluster.conf, clusters/*.conf  # Cluster selection (tapuz, c6620): nodes, paths, defaults
 │   │   ├── run-experiment-loopback-fs.sh  # Main orchestrator
+│   │   ├── run-2x2.sh                     # Load x page-cache test at k=1 and k=1024
+│   │   ├── summarize-runs.py              # Comparison table (with 95% CIs) from runs.csv
+│   │   ├── analyze-counters.py            # Job-counter table per k (also for old runs)
 │   │   ├── start-single-dn-cluster.sh     # Start cluster with k loopback dirs per DN
 │   │   ├── stop-single-dn-cluster.sh      # Stop cluster and tear down loopbacks
 │   │   ├── generate-single-dn-configs.sh  # Generate hdfs-site.xml with k data dirs
@@ -317,17 +322,18 @@ python3 experiments/mini_dfs_cluster/plot_fixed_blocks.py \
 
 **Purpose**: Measure how WordCount performance, disk I/O, and NameNode memory scale as the number of loopback-backed storage directories per DataNode grows from 1 to 1024. Tests whether splitting one DataNode's storage across many virtual disks helps or hurts performance, and at what k the overhead becomes the bottleneck.
 
-**Design**: Cluster topology stays fixed — one DataNode process per physical node. Only `k` (the number of ext4 loopback filesystems listed in `dfs.datanode.data.dir`) varies. Each image is sized as `floor(220 GB × 1024 / k)` MB, keeping total disk use per node within 220 GB.
+**Design**: Cluster topology stays fixed — one DataNode process per physical node. Only `k` (the number of ext4 loopback filesystems listed in `dfs.datanode.data.dir`) varies. Each image is sized as `floor(budget × 1024 / k)` MB (minimum 100 MB), keeping total disk use per node within the loopback budget (200 GB by default).
 
 #### Parameters
 
 | Parameter | Value |
 |-----------|-------|
-| k values | 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 |
-| Input | 22 GB, 16 MB blocks, replication = 3 |
-| Repetitions | 5 runs per k (averaged) |
+| k values | `K_VALUES` (default 1, 256, 1024; April 2026 sweeps used 1..1024) |
+| Input | `INPUT_SIZE_GB` (default 8 GB), `BLOCK_SIZE_MB` (default 32 MB), replication = 3 |
+| Repetitions | 5 per k and condition |
+| YARN pool | tapuz 8 x 2 GB per node, c6620 52 x 1 GB (`SLOTS_PER_NODE`, `CONTAINER_MB`) |
 | DataNode heap | 5 500 MB / node |
-| Loopback budget | 220 GB / node |
+| Loopback budget | 200 GB / node |
 
 #### Cluster topology
 
@@ -368,18 +374,26 @@ Each mount: /scratch/hdfs_loop/dnX <- loop device <- /scratch/loop_images/hdfs_d
 
 #### Running
 
+Full instructions (Tapuz and CloudLab, all settings, outputs):
+[experiments/storage_virtualization_loopback/README.md](experiments/storage_virtualization_loopback/README.md).
+Results so far: [FINDINGS.md](experiments/storage_virtualization_loopback/FINDINGS.md).
+
 ```bash
-cd experiments/storage_virtualization_loopback
+# laptop (Git Bash): send the code to tapuz14
+bash sync-cluster.sh push
 
-# Full experiment: k=1..1024, 5 repetitions each (~5-8 hours)
-bash run-experiment-loopback-fs.sh
+# tapuz14 (inside screen): the cluster is picked from the hostname (CLUSTER=tapuz|c6620)
+cd ~/my_scripts/experiments/storage_virtualization_loopback
+bash run-2x2.sh                                              # load x cache test
+K_VALUES="1 16 128 512 1024" bash run-experiment-loopback-fs.sh 5   # k sweep
 
-# Custom repetition count
-bash run-experiment-loopback-fs.sh 3
-
-# Plot a completed run
-python3 plot-results.py results/storage_virtualization_loopback/latest
+# laptop: fetch results and plot
+bash sync-cluster.sh pull
+python3 experiments/storage_virtualization_loopback/plot-results.py ../storage_virtualization_loopback_tapuz/run_<id>
 ```
+
+Besides `results.csv` below, every run writes `runs.csv` (one row per job:
+runtime, disk MB read, map counts, locality) and `summary.txt`.
 
 #### Metrics collected and why
 
