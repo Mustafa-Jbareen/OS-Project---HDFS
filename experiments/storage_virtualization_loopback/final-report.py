@@ -95,6 +95,15 @@ def fmt_points(d, ci):
     return f"{d:+.1f} points" + (f" [{ci[0]:+.1f}, {ci[1]:+.1f}]" if ci else "")
 
 
+def fmt_mb(mb):
+    """102400 -> '100 GB', 1536 -> '1.5 GB', 512 -> '512 MB'."""
+    try:
+        mb = float(mb)
+    except (TypeError, ValueError):
+        return "?"
+    return f"{mb / 1024:g} GB" if mb >= 1024 else f"{mb:g} MB"
+
+
 def verdict(ci, pos="larger", neg="smaller"):
     if not ci:
         return "(too few repetitions for an interval)"
@@ -250,7 +259,7 @@ def section_setup(run, lines):
     lines += [
         f"- Cluster **{m.get('cluster')}**, DataNode hosts: {', '.join(m.get('datanode_host_names', []))}; code {m.get('code_version')}",
         f"- YARN pool per node: {m.get('yarn_slots_per_node')} x {m.get('yarn_container_mb')} MB; task heap {m.get('task_heap_mb')} MB; DataNode heap {m.get('datanode_heap_mb')} MB",
-        f"- Input {m.get('input_size_mb')} MB in {m.get('block_size_human')} blocks, replication {m.get('replication')}, uploaded {m.get('input_uploaded')}",
+        f"- Input {fmt_mb(m.get('input_size_mb'))} in {m.get('block_size_human')} blocks, replication {m.get('replication')}, uploaded {m.get('input_uploaded')}",
         f"- Loopback budget {m.get('loopback_budget_per_node_gb')} GB per host; mkfs {m.get('mkfs_mode')}; direct I/O {m.get('loop_direct_io')}",
         f"- k values {m.get('k_values')} (order {m.get('k_order')}), {m.get('repetitions')} repetitions per k and condition, seed {m.get('seed')}",
         f"- Per-job protocol: {m.get('per_job_protocol')}; {m.get('warmup_jobs_per_k')} warm-up job(s) per k; speculative execution {m.get('speculative_execution')}",
@@ -298,16 +307,16 @@ def section_factors(run, lines):
     for cache in ("cold", "warm"):
         if (1, cache) in by and (mmax, cache) in by:
             d, ci = diff_changes(ch[by[(mmax, cache)]], ch[by[(1, cache)]])
-            lines.append(f"- **Load ({cache} cache):** slowdown at k={kmax} with {mmax} maps/node minus "
+            lines.append(f"- **Load ({cache} cache):** slowdown at k={kmax} with {load_label(mmax)} minus "
                          f"slowdown with 1 map/node: {fmt_points(d, ci)} -- {verdict(ci)}.")
     middle = sorted(m for m, cache in info.values() if 1 < m < mmax and cache == "cold")
     if middle and (1, "cold") in by and (mmax, "cold") in by:
         steps = [(1, ch[by[(1, 'cold')]])] + [(m, ch[by[(m, 'cold')]]) for m in middle] + [(mmax, ch[by[(mmax, 'cold')]])]
-        lines.append("- **Load steps (cold):** " + ", ".join(f"{m} maps/node {fmt_change(*v)}" for m, v in steps))
+        lines.append("- **Load steps (cold):** " + ", ".join(f"{load_label(m)} {fmt_change(*v)}" for m, v in steps))
     for m in sorted({m for m, _ in info.values()}):
         if (m, "cold") in by and (m, "warm") in by:
             d, ci = diff_changes(ch[by[(m, "warm")]], ch[by[(m, "cold")]])
-            lines.append(f"- **Page cache ({m} maps/node):** slowdown warm minus slowdown cold: "
+            lines.append(f"- **Page cache ({load_label(m)}):** slowdown warm minus slowdown cold: "
                          f"{fmt_points(d, ci)} -- {verdict(ci)}.")
     lines.append("")
 
@@ -402,7 +411,7 @@ def section_bench(bench_dir, lines, figs):
     if not header_table:
         lines += ["(storage benchmark not run or no data)", ""]
         return
-    lines += [f"Same loopback disks and data per host as the HDFS runs ({meta.get('data_mb_per_host')} MB in "
+    lines += [f"Same loopback disks and data per host as the HDFS runs ({fmt_mb(meta.get('data_mb_per_host'))} in "
               f"{meta.get('file_mb')} MB files), read by plain parallel readers.", ""]
     lines += md_table(*header_table) + [""]
     for (readers, cache), (pct, ci) in sorted(changes.items()):
@@ -462,7 +471,7 @@ class FigureMaker:
             self.enabled = False
             self.why = str(e)
         hosts = meta.get("datanode_hosts") or len(meta.get("datanode_host_names", []))
-        self.subtitle = (f"{meta.get('cluster', '?')}, {hosts} DataNode hosts; input {meta.get('input_size_mb', '?')} MB "
+        self.subtitle = (f"{meta.get('cluster', '?')}, {hosts} DataNode hosts; input {fmt_mb(meta.get('input_size_mb'))} "
                          f"in {meta.get('block_size_human', '?')} blocks; {meta.get('repetitions', '?')} jobs per point; "
                          f"shaded band = 95% confidence interval")
 
@@ -556,7 +565,7 @@ def figure_bench(bench_dir, figs, lines):
                            "x": ks, "y": ys, "lo": los, "hi": his})
         cells.append(series)
         titles.append(CACHE_TITLES[cache])
-    subtitle = (f"{meta.get('cluster', '?')}; {meta.get('data_mb_per_host', '?')} MB per host in "
+    subtitle = (f"{meta.get('cluster', '?')}; {fmt_mb(meta.get('data_mb_per_host'))} per host in "
                 f"{meta.get('file_mb', '?')} MB files, read with plain parallel readers (no Hadoop); "
                 f"{meta.get('repetitions', '?')} reads x hosts per point; band = 95% CI")
     figs.rf.change_grid(figs.path("fig3_storage_stack_alone"), "The storage stack alone: read time vs k",
