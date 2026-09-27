@@ -39,8 +39,9 @@ What is measured:
   the rest, then about 13 hours.
 - **Next:**
   - `.\sync-cluster.ps1 pull`, then write the conclusion from `FINAL_REPORT.md`;
-  - then the large-input run, 100 GB in 16 MB blocks (`run-large-input.sh`,
-    about 24 h). The steps are in [COMMANDS.md](COMMANDS.md) section 8.
+  - then the same pipeline with 100 GB in 16 MB blocks
+    (`run-all.sh --input-gb 100 --block-mb 16 --reps 3`, about 5.5 days).
+    The steps are in [COMMANDS.md](COMMANDS.md) section 8.
 - **CloudLab:** there is no reservation right now, so everything runs on Tapuz.
 
 ## What the old runs showed
@@ -168,35 +169,48 @@ The other stages:
 
 The whole pipeline takes about 13 h, or about 9 h with `--reps 3`.
 
-### Large-input run (`run-large-input.sh`, planned after the pipeline)
+### Large-input pipeline (`run-all.sh --input-gb 100 --block-mb 16`, planned next)
 
-This is the April-style experiment with the new protocol: a large input read
-from disk under full load.
+The same pipeline and protocol, with a large input read from disk, as in the
+April runs. `--input-gb` and `--block-mb` set the input of the main run and
+both controls, and the benchmark writes the same amount per worker. If the
+block files per worker exceed half of a worker's RAM, every warm condition is
+dropped automatically.
 
 | Setting | Value |
 |---|---|
 | Input | 100 GB in 16 MB blocks = 6400 map tasks per job |
 | Data per worker | 75 GB of block files (3 replicas over 4 workers), far more than 7.7 GB of RAM |
-| Conditions | 8 maps per node, cold only (a warm cache can't exist at this size) |
-| k | 1, 64, 256, 512, 1024 (random order); same 200 GB budget and images as the main run |
-| Repetitions | 3 |
-| Warm-up job | none (`WARMUP_JOBS=0`) |
-| Results | `results/storage_virtualization_loopback_tapuz_100GB_16MB/run_<date>/` |
-| Time on Tapuz | ~24 h (~15 h with `K_VALUES="1 512 1024"`) |
-
-Why no warm-up job:
-
-- a warm-up job only absorbs a few seconds of first-job overhead, which is
-  negligible against ~80-minute jobs, and it would add about 6 hours;
-- each job's DataNode metrics still start at a snapshot taken just before it.
+| Main-run conditions | 1, 4 and 8 maps per node, all cold (a warm cache can't exist at this size) |
+| k | 1, 64, 256, 512, 1024 (random order); same 200 GB budget and images as before |
+| Repetitions | 3 (`--reps 3`); warm-up job per k as in the main pipeline |
+| Smoke test | 2 GB in 16 MB blocks (128 maps), the same 3 conditions, k = 1 and 4 |
+| Bench | 75 GB per worker in 16 MB files, 1 and 8 readers, cold only |
+| Controls | direct I/O and default mkfs: 8 maps per node, cold, k = 1 and 1024 |
+| Results | `results/pipeline_<date>_100GB_16MB/` |
 
 At k=1024 each 200 MB filesystem holds about 5 blocks (75 MB).
 
-Time estimate, scaled from the April 40 GB / 16 MB run (30 min per job at
-k=1, 12 min upload, 9 min to generate the input):
+Time per 100 GB job on Tapuz, estimated from two old runs:
 
-- about 25 minutes, once, to generate the input;
-- per k, a 30-minute upload plus 75-90 minutes per job.
+| Load | Per job | From |
+|---|---|---|
+| 8 maps per node | ~75 min | April 40 GB / 16 MB run: 30 min per job at ~29 maps at once |
+| 4 maps per node | ~1 h | estimate between the two |
+| 1 map per node | ~3.4 h | May 25 GB / 16 MB run: 52 min per job at ~2.6 maps at once |
+
+Other times:
+
+- **Upload:** ~30 min per k.
+- **Generating the input:** ~25 min, once.
+
+Total time:
+
+| Setting | Main run | Whole pipeline |
+|---|---|---|
+| `--reps 3` | ~4 days | ~5.5 days (the benchmark and controls add ~30 h) |
+| `--reps 5` | -- | ~8 days |
+| `MAIN_K_VALUES="1 256 1024"`, `--reps 3` | -- | ~4 days |
 
 ### Loopback image sizes
 
@@ -273,13 +287,12 @@ That is the layout every run before September 2026 used at k ≥ 512.
 | File | What it does |
 |---|---|
 | `sync-cluster.ps1` | laptop: push the code, pull the results (and write the report) |
-| `run-all.sh` | the whole pipeline, stages 0-6 |
+| `run-all.sh` | the whole pipeline, stages 0-6; `--input-gb` / `--block-mb` for another input |
 | `clean-scratch.sh` | stage 0: stop Hadoop, remove loopback disks and your leftovers in `/scratch` |
 | `bootstrap-tapuz.sh`, `bootstrap-c6620.sh` | pre-flight checks of the nodes |
 | `run-2x2.sh` | the smoke test (`smoke`) or the full 2x2 on its own |
 | `run-experiment-loopback-fs.sh` | one run: every k, condition and repetition |
 | `storage-bench.sh` | the storage stack without Hadoop |
-| `run-large-input.sh` | the large-input run: 100 GB in 16 MB blocks, cold, full load |
 | `start-/stop-single-dn-cluster.sh`, `setup-/teardown-loopback-fs.sh`, `generate-single-dn-configs.sh` | cluster and virtual disks for one k |
 | `cache-step.py` | cold / warm / measure, on each DataNode host |
 | `summarize-runs.py` | comparison table; `--check` gives the smoke checks |

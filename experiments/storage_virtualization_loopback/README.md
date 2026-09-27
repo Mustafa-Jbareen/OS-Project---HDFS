@@ -95,6 +95,30 @@ to it): one folder per stage, `pipeline.log`, `stages.env`, `FINAL_REPORT.md`.
 On the laptop (PowerShell), `.\sync-cluster.ps1 pull` copies the pipeline
 folder and writes the report again there, with the figures (matplotlib).
 
+### Another input size: `--input-gb` and `--block-mb`
+
+```bash
+bash run-all.sh --input-gb 100 --block-mb 16 --reps 3    # ~5.5 days on tapuz
+```
+
+This is the same pipeline with the April-style large input, read from disk:
+
+- The main run and both controls use that input, and the benchmark writes
+  the same amount per worker.
+- The smoke test keeps a 2 GB input with the chosen block size, so the gate
+  still comes after ~30 minutes.
+- When the block files per worker (input x 3 replicas / 4 workers; 75 GB
+  here) exceed half of a worker's RAM, every warm condition is dropped. The
+  main run then has 1, 4 and 8 maps per node, all cold, and the benchmark and
+  the direct-I/O control run cold only.
+- Results go to `results/pipeline_<timestamp>_100GB_16MB/`.
+- `--from` and `--only` continue a pipeline with the input it was started
+  with.
+
+At 100 GB, 1 map per node takes about 3.4 h per job (8 maps per node about
+75 min), which is where most of the time goes. `MAIN_K_VALUES="1 256 1024"`
+in front of the command shortens the run to about 4 days.
+
 ## Single runs
 
 On the laptop, in PowerShell, from `my_scripts\`:
@@ -109,15 +133,8 @@ On tapuz14:
 cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
 bash run-2x2.sh smoke                 # small 2x2; ends with READY / NOT READY
 bash run-2x2.sh                       # full 2x2: k = 1 64 256 512 1024
-bash storage-bench.sh                 # storage stack alone
-bash run-large-input.sh               # 100 GB in 16 MB blocks, cold, full load (~24 h)
+bash storage-bench.sh                 # storage stack alone (CACHES="cold" for cold only)
 ```
-
-`run-large-input.sh` is the April-style run under the new protocol. The input
-is far larger than RAM (75 GB per worker), so it runs cold only, with no
-warm-up job. It cleans `/scratch` first and writes `checks.txt` and
-`FINAL_REPORT.md` at the end. Its results go to
-`results/storage_virtualization_loopback_<cluster>_100GB_16MB/`.
 
 `summary.txt` in each run folder holds the comparison table (`checks.txt` for
 the smoke test). `final-report.py <run folder>` writes a report with the

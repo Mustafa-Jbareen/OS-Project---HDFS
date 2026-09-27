@@ -22,6 +22,7 @@
 #   REPS           repetitions per cell (default 3)
 #   K_VALUES       default "1 256 1024"
 #   READERS        default "1 $SLOTS_PER_NODE"
+#   CACHES         default "cold warm"; "cold" when the data cannot fit in RAM
 #   BENCH_DATA_MB  data per host (default: MATRIX_INPUT_GB x 1024 x 3 / hosts)
 #
 # OUTPUT: results/storage_bench_<cluster>/run_<timestamp>/ (or RESULTS_BASE):
@@ -40,6 +41,10 @@ export USER="${USER:-$(id -un)}"
 REPS=${1:-${REPS:-3}}
 read -r -a K_VALUES <<< "${K_VALUES:-1 256 1024}"
 read -r -a READERS <<< "${READERS:-1 $SLOTS_PER_NODE}"
+read -r -a CACHES <<< "${CACHES:-cold warm}"
+for c in "${CACHES[@]}"; do
+    [[ "$c" == "cold" || "$c" == "warm" ]] || { echo "CACHES: '$c' is not cold or warm" >&2; exit 1; }
+done
 MIN_IMAGE_SIZE_MB=100
 SEED=${SEED:-$(date +%s)}
 
@@ -137,7 +142,7 @@ echo "============================================================"
 echo "Cluster:        $CLUSTER   hosts: ${DATANODE_NODES[*]}"
 echo "k values:       ${K_VALUES[*]}"
 echo "Data per host:  ${BENCH_DATA_MB}MB = $NUM_FILES files x ${FILE_MB}MB"
-echo "Readers:        ${READERS[*]}   cache: cold, warm   reps: $REPS   seed: $SEED"
+echo "Readers:        ${READERS[*]}   cache: ${CACHES[*]}   reps: $REPS   seed: $SEED"
 echo "Loop devices:   mkfs=$MKFS_MODE, direct I/O=$LOOP_DIRECT_IO, budget ${LOOPBACK_BUDGET_PER_NODE_GB}GB/host"
 echo "Results:        $RUN_DIR"
 echo "============================================================"
@@ -168,11 +173,11 @@ done
 K_CSV=$(IFS=,; echo "${K_VALUES[*]}")
 R_CSV=$(IFS=,; echo "${READERS[*]}")
 python3 - "$RUN_DIR" "$CLUSTER" "$K_CSV" "$R_CSV" "$REPS" "$SEED" "$BENCH_DATA_MB" "$FILE_MB" \
-    "$MKFS_MODE" "$LOOP_DIRECT_IO" "$LOOPBACK_BUDGET_PER_NODE_GB" "$SETTLE_SECONDS" <<'PY'
+    "$MKFS_MODE" "$LOOP_DIRECT_IO" "$LOOPBACK_BUDGET_PER_NODE_GB" "$SETTLE_SECONDS" "${CACHES[*]}" <<'PY'
 import json, os, sys
 from datetime import datetime
 (run_dir, cluster, ks, readers, reps, seed, data_mb, file_mb,
- mkfs, dio, budget, settle) = sys.argv[1:13]
+ mkfs, dio, budget, settle, caches) = sys.argv[1:14]
 hardware = []
 for line in open(os.path.join(run_dir, "hardware.txt")):
     f = line.strip().split("|")
@@ -181,7 +186,7 @@ for line in open(os.path.join(run_dir, "hardware.txt")):
 meta = {
     "experiment_type": "storage_bench", "cluster": cluster,
     "k_values": [int(x) for x in ks.split(",")], "readers": [int(x) for x in readers.split(",")],
-    "repetitions": int(reps), "seed": int(seed), "data_mb_per_host": int(data_mb),
+    "caches": caches.split(), "repetitions": int(reps), "seed": int(seed), "data_mb_per_host": int(data_mb),
     "file_mb": int(file_mb), "mkfs_mode": mkfs, "loop_direct_io": dio == "1",
     "loopback_budget_per_node_gb": int(budget), "settle_seconds": int(settle),
     "cache_step": "same as the HDFS runs (cache-step.py)", "hardware": hardware,
@@ -195,7 +200,9 @@ echo "node,k,seconds,mb,mb_per_s" > "$WCSV"
 
 CELLS=()
 for r in "${READERS[@]}"; do
-    CELLS+=("${r}:cold" "${r}:warm")
+    for c in "${CACHES[@]}"; do
+        CELLS+=("${r}:${c}")
+    done
 done
 
 for k in "${K_VALUES[@]}"; do

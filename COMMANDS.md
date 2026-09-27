@@ -149,33 +149,44 @@ python experiments\storage_virtualization_loopback\final-report.py ..\storage_vi
    .\sync-cluster.ps1 pull
    ```
 
-3. LOCAL: send the code again. It contains `run-large-input.sh`, and push
-   only works once nothing is running.
+3. LOCAL: send the new code. `run-all.sh` now takes `--input-gb` and
+   `--block-mb`. Push only works once nothing is running.
 
    ```powershell
    .\sync-cluster.ps1 push
    ```
 
-4. TAPUZ: start the run. `screen -r exp` returns to the finished session and
-   gives you a prompt; if that session is gone, use `screen -S exp`.
+4. TAPUZ: start the large pipeline. `screen -r exp` returns to the finished
+   session and gives you a prompt; if that session is gone, use `screen -S exp`.
 
    ```bash
    screen -r exp
    cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
-   bash run-large-input.sh          # 100 GB, 16 MB blocks, 3 repetitions: about 24 h
+   bash run-all.sh --input-gb 100 --block-mb 16 --reps 3
    ```
 
-   Detach with **Ctrl+A, then D**. The script cleans `/scratch` itself.
-   For a shorter run use `K_VALUES="1 512 1024" bash run-large-input.sh`
-   (about 15 h). To watch it:
+   Detach with **Ctrl+A, then D**. It is the same pipeline, with this input:
+
+   - 75 GB of block files per worker can't stay in RAM, so every condition is
+     cold: 1, 4 and 8 maps per node, plus the benchmark and both controls;
+   - the smoke test keeps a 2 GB input (with 16 MB blocks), so the gate still
+     comes after ~30 minutes;
+   - it takes about 5.5 days with `--reps 3` and about 8 days with
+     `--reps 5`. 1 map per node is the slow part, at about 3.4 h per job.
+
+   To shorten it, start it as
+   `MAIN_K_VALUES="1 256 1024" bash run-all.sh --input-gb 100 --block-mb 16 --reps 3`
+   (about 4 days). To watch it:
 
    ```bash
-   tail -f $(ls -d /home/mostufa.j/my_scripts/results/storage_virtualization_loopback_tapuz_100GB_16MB/run_* | tail -1)/experiment.log
+   tail -f /home/mostufa.j/my_scripts/results/pipeline_latest/pipeline.log
    ```
 
+   If you stop it, `bash run-all.sh --from <stage>` continues it with the
+   same 100 GB input; there's no need to repeat `--input-gb`.
+
 5. LOCAL, when it is done: `.\sync-cluster.ps1 pull`. The report and figures
-   go into
-   `hadoop\storage_virtualization_loopback_tapuz_100GB_16MB\run_<date>\`.
+   go into `hadoop\pipeline_<date>_100GB_16MB\`.
 
 ## 9. Single runs instead of the pipeline
 
@@ -185,7 +196,6 @@ TAPUZ, in the experiment folder, inside screen:
 bash run-2x2.sh smoke                    # small 2x2, ~35 min, ends with READY / NOT READY
 bash run-2x2.sh                          # full 2x2: k = 1 64 256 512 1024, 5 repetitions
 bash storage-bench.sh                    # the storage stack alone, no Hadoop
-bash run-large-input.sh                  # 100 GB in 16 MB blocks, cold, full load (~24 h)
 K_VALUES="1 1024" bash run-2x2.sh 3      # any setting can be overridden like this
 ```
 
