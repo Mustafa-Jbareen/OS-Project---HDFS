@@ -93,7 +93,7 @@ my_scripts/
 │   │   ├── setup-loopback-fs.sh           # Create / format / mount loopback images
 │   │   ├── teardown-loopback-fs.sh        # Unmount and remove loopback images
 │   │   ├── count-input-blocks-per-fs.sh   # Count input blocks per loopback FS on disk
-│   │   └── plot-results.py                # Generate all plots from a results directory
+│   │   └── final-report.py                # FINAL_REPORT.md + the five figures (report_figures.py)
 │   │
 │   └── results/                           # Experiment output (gitignored)
 │
@@ -371,7 +371,7 @@ Each mount: /scratch/hdfs_loop/dnX <- loop device <- /scratch/loop_images/hdfs_d
 | `setup-loopback-fs.sh` | Creates, formats (ext4), and mounts k image files per node |
 | `teardown-loopback-fs.sh` | Unmounts and removes loopback images |
 | `count-input-blocks-per-fs.sh` | Counts input-file blocks on disk per loopback FS (parallelised) |
-| `plot-results.py <run_dir>` | Generates all plots from a results directory |
+| `final-report.py <pipeline_or_run_dir>` | FINAL_REPORT.md with the five figures (PNG + PDF) |
 
 #### Running
 
@@ -379,18 +379,21 @@ Full instructions (Tapuz and CloudLab, all settings, outputs):
 [experiments/storage_virtualization_loopback/README.md](experiments/storage_virtualization_loopback/README.md).
 Results so far: [FINDINGS.md](experiments/storage_virtualization_loopback/FINDINGS.md).
 
-```bash
-# laptop (Git Bash): send the code to tapuz14
-bash sync-cluster.sh push
+```powershell
+# laptop (Windows PowerShell, in my_scripts): send the code to tapuz14
+.\sync-cluster.ps1 push
+```
 
+```bash
 # tapuz14 (inside screen): the cluster is picked from the hostname (CLUSTER=tapuz|c6620)
 cd ~/my_scripts/experiments/storage_virtualization_loopback
 bash run-all.sh      # smoke test (gate) -> main run -> storage benchmark -> controls -> FINAL_REPORT.md (~13 h)
 K_VALUES="1 16 128 512 1024" bash run-experiment-loopback-fs.sh 5   # k sweep
+```
 
-# laptop: fetch results and plot
-bash sync-cluster.sh pull
-python3 experiments/storage_virtualization_loopback/final-report.py ../pipeline_<timestamp>
+```powershell
+# laptop: fetch the results; writes FINAL_REPORT.md with the figures
+.\sync-cluster.ps1 pull
 ```
 
 Besides `results.csv` below, every run writes `runs.csv` (one row per job:
@@ -417,15 +420,16 @@ nn_heap_before_mb, nn_heap_peak_mb, nn_heap_avg_mb, nn_block_count,
 block_counts_per_fs, input_block_counts_per_fs, fs_used_mb_per_fs
 ```
 
-#### Output plots (~32 PNGs per run)
+#### Figures (final-report.py, PNG + PDF)
 
-**Runtime**: `runtime_vs_k.png`, `runtime_vs_total_dirs.png`, `runtime_vs_k_logscale.png`, `individual_runs.png`, `speedup_vs_k.png`
+Only the figures the conclusion needs (the old 35-plot script was removed in
+September 2026):
 
-**NameNode memory**: `nn_memory_vs_k.png`, `runtime_and_memory_vs_k.png`, `nn_memory_timeseries.png`
-
-**Block distribution**: `per_fs_block_distribution.png`, `input_blocks_per_fs.png`, `input_blocks_boxplot.png`, `input_blocks_balance.png`, `fs_capacity_per_node.png`, `fs_capacity_balance.png`
-
-**iostat (one file per metric)**: `iostat_latency_vs_k.png`, `iostat_util_vs_k.png`, 8× `iostat_ts_<metric>.png` (time series), 10× `iostat_node_<metric>.png` (per node/device)
+1. `fig1_runtime_vs_k` -- runtime change vs k, one line per load level, cold | warm cache
+2. `fig2_where_the_time_goes` -- change in time per map task, DataNode time per block served, CPU per map task
+3. `fig3_storage_stack_alone` -- the same loopback disks read without Hadoop
+4. `fig4_controls` -- slowdown at the largest k: main run vs direct-I/O loop devices vs default mkfs layout
+5. `fig5_server_cost` -- DataNode threads and memory, NameNode heap, block reports, start-up, upload throughput
 
 #### iostat measurement design
 
@@ -518,7 +522,7 @@ pip install matplotlib numpy
 | `plot-multinode-results.py` | Multi-node CSV (with averages) | Combined lines, per-node bars, heatmap, speedup — all with error bars |
 | `plot_memory.py` | MiniDFS memory CSV | Memory vs DataNodes (linear/log) |
 | `plot_fixed_blocks.py` | Fixed-blocks CSV | Memory vs DataNodes + Blocks/DN dual-axis; Memory vs Blocks/DN |
-| `storage_virtualization_loopback/plot-results.py` | Storage virtualization run dir | ~32 plots: runtime, NN memory, block distribution, iostat I/O (one file per metric) |
+| `storage_virtualization_loopback/final-report.py` | Pipeline or run dir | FINAL_REPORT.md + 5 figures (runtime vs k, where the time goes, storage stack alone, controls, server cost) |
 
 ---
 

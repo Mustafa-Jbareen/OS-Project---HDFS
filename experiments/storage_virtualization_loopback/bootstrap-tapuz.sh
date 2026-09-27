@@ -2,7 +2,8 @@
 ################################################################################
 # SCRIPT: bootstrap-tapuz.sh
 # DESCRIPTION: One-time pre-flight for the tapuz HDD cluster.
-#              - Verifies /scratch exists and we can sudo mkdir/chmod inside it
+#              - Verifies /scratch exists and we can sudo mkdir/chmod inside it;
+#                shows its free space and leftover loopback mounts
 #              - Verifies passwordless SSH between nodes
 #              - Reports presence of iostat, filefrag, bc, java, hadoop
 #              - Verifies the specific NOPASSWD sudo commands the experiment
@@ -56,8 +57,12 @@ if ! sudo -n /bin/chmod 777 "$testdir" 2>/dev/null; then
 fi
 sudo -n /bin/rmdir "$testdir" 2>/dev/null || true
 df -h "$mp" | tail -1 | awk '{printf "  %s available on %s (mount %s, used %s)\n", $4, $1, $6, $5}'
+echo "  loopback mounts left from earlier runs: $(grep -c hdfs_loop /proc/mounts || true)"
 REMOTE
 done
+if [[ "$ALL_OK" != "1" ]]; then
+    echo "  FAIL: fix the ERROR lines above (storage folder or sudo mkdir/chmod)."
+fi
 
 # ---- Step 2: verify passwordless SSH ---------------------------------------
 echo ""

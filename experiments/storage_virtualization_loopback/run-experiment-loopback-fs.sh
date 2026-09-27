@@ -47,7 +47,7 @@
 #                  bytes read/written during the job, Hadoop job counters
 #   summary.txt    per condition and k: mean runtime, change vs the smallest k,
 #                  load (maps running at once), locality, disk reads
-#   results.csv    per-k summary read by plot-results.py (first condition;
+#   results.csv    per-k summary: runtimes, NameNode memory, blocks per filesystem (first condition;
 #                  results_<condition>.csv for each condition when several)
 #   dn_metrics.csv per job: DataNode blocks served, time to serve one block,
 #                  packet transfer time (from the DataNodes' own metrics)
@@ -1541,10 +1541,13 @@ echo "============================================================"
 echo ""
 echo "Results saved to: $RUN_DIR"
 echo "  - summary.txt / runs.csv          : per-job results and the comparison table"
-echo "  - results.csv                     : per-k summary (input of plot-results.py)"
+echo "  - results.csv                     : per-k summary (NameNode memory, blocks per filesystem)"
 echo "  - metadata.json, configs/, jobs/  : settings, Hadoop configs, job output"
 echo "  - namenode_memory/, iostat/, sysstat/ : monitors"
 echo ""
-echo "Generate plots with:"
-echo "  python3 $SCRIPT_DIR/plot-results.py $RUN_DIR"
+REL_RUN=${RUN_DIR#"$PROJECT_ROOT/results/"}
+echo "Report with figures (needs matplotlib):"
+echo "  here:    python3 $SCRIPT_DIR/final-report.py $RUN_DIR"
+echo "  laptop:  .\\sync-cluster.ps1 pull, then in PowerShell (in my_scripts):"
+echo "           python experiments\\storage_virtualization_loopback\\final-report.py ..\\${REL_RUN//\//\\}"
 echo "============================================================"

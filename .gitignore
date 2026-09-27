@@ -10,6 +10,3 @@ target/
 
 # Experiment results are copied back to the laptop, not versioned
 results/
-
-# Written by sync-cluster.sh push
-VERSION

@@ -238,4 +238,4 @@ fi
 plog ""
 plog "Finished after $(( ($(date +%s) - PIPE_T0) / 60 )) min. Stage status:"
 grep "_STATUS=" "$PIPE_DIR/stages.env" | tee -a "$PLOG" || true
-plog "Copy everything to the laptop with (on the laptop): bash sync-cluster.sh pull"
+plog "Copy everything to the laptop with (on the laptop, in PowerShell): .\sync-cluster.ps1 pull"

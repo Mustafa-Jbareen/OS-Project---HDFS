@@ -14,33 +14,37 @@ only edits code and looks at results.
 
 ## Tapuz checklist (exact commands)
 
-**LOCAL** = the laptop, in **Git Bash** (VS Code terminal -> Git Bash), not
-PowerShell. **TAPUZ** = logged in to tapuz14 (`ssh mostufa.j@tapuz14.cslcs.technion.ac.il`).
+**LOCAL** = the laptop (Windows), in **PowerShell** (the VS Code terminal).
+**TAPUZ** = tapuz14 (Linux); log in from PowerShell with
+`ssh mostufa.j@tapuz14.cslcs.technion.ac.il`.
 
 1. LOCAL, once -- install the laptop's ssh key (asks the Tapuz password one
    last time; the home folder is shared by all tapuz nodes):
-   ```bash
-   cat ~/.ssh/id_ed25519.pub | ssh mostufa.j@tapuz14.cslcs.technion.ac.il 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
+   ```powershell
+   Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub | ssh mostufa.j@tapuz14.cslcs.technion.ac.il "mkdir -p ~/.ssh && chmod 700 ~/.ssh && tr -d '\r' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
    ssh mostufa.j@tapuz14.cslcs.technion.ac.il hostname      # prints tapuz14, no password
    ```
 2. TAPUZ, once -- put the old copy aside (nothing is deleted, old results included):
    ```bash
-   mv ~/my_scripts ~/my_scripts_old_$(date +%F)
+   mv ~/my_scripts ~/my_scripts_before_sep2026
    ```
-3. LOCAL -- send the code (again after every change; commit first):
-   ```bash
-   cd /c/Users/mostufa.j/Desktop/Dan/hadoop/my_scripts
-   bash sync-cluster.sh push
+3. LOCAL -- send the code (again after every change):
+   ```powershell
+   cd C:\Users\mostufa.j\Desktop\Dan\hadoop\my_scripts
+   .\sync-cluster.ps1 push
    ```
+   Afterwards `~/my_scripts` on tapuz14 matches the laptop folder, with Linux
+   line endings. Its `VERSION` file records the commit; the version ends in
+   `-dirty` when there are uncommitted changes. Push refuses while an
+   experiment is running.
 4. TAPUZ, once -- clean the nodes and check them:
    ```bash
    cd ~/my_scripts/experiments/storage_virtualization_loopback
    bash stop-single-dn-cluster.sh 1024       # stop Hadoop, remove loopback disks on tapuz10-13
-   rm -f /scratch/tmp/wordcount_*MB.txt      # old input copies on tapuz14
-   bash bootstrap-tapuz.sh                   # ssh, sudo and tools on every node: no MISSING
-   for n in tapuz10 tapuz11 tapuz12 tapuz13; do ssh $n 'echo "$(hostname): $(df -BG --output=avail /scratch | tail -1) free, $(grep -c hdfs_loop /proc/mounts) loop mounts"'; done
+   bash bootstrap-tapuz.sh                   # ssh, sudo, tools, free space and loop mounts per node
    ```
-   Each worker needs >= 205 GB free and 0 loop mounts.
+   No line may say MISSING or FAIL. Each worker needs >= 205 GB free on
+   /scratch and 0 loopback mounts.
 5. TAPUZ -- run everything (inside screen, so it survives logging out):
    ```bash
    screen -S exp
@@ -50,11 +54,12 @@ PowerShell. **TAPUZ** = logged in to tapuz14 (`ssh mostufa.j@tapuz14.cslcs.techn
    Detach with Ctrl+A then D; `screen -r exp` to come back;
    `tail -f ~/my_scripts/results/pipeline_latest/pipeline.log` to watch.
 6. LOCAL -- when it is done:
-   ```bash
-   cd /c/Users/mostufa.j/Desktop/Dan/hadoop/my_scripts
-   bash sync-cluster.sh pull                 # -> hadoop/pipeline_<timestamp>/
-   python experiments/storage_virtualization_loopback/final-report.py ../pipeline_<timestamp>   # adds the figures
+   ```powershell
+   cd C:\Users\mostufa.j\Desktop\Dan\hadoop\my_scripts
+   .\sync-cluster.ps1 pull
    ```
+   This copies the results to `hadoop\pipeline_<date>\` and writes
+   `FINAL_REPORT.md` there, with the figures in `figures\`.
 
 To stop a run (TAPUZ): `screen -r exp`, Ctrl+C, then
 `bash stop-single-dn-cluster.sh 1024`; continue later with
@@ -83,17 +88,15 @@ to it): one folder per stage, `pipeline.log`, `stages.env`, `FINAL_REPORT.md`.
 `bash run-all.sh --from N` continues the latest pipeline at stage N;
 `--only N` runs one stage. Follow it with `tail -f ~/my_scripts/results/pipeline_latest/pipeline.log`.
 
-On the laptop: `bash sync-cluster.sh pull`, then run
-`python experiments/storage_virtualization_loopback/final-report.py ../pipeline_<timestamp>`
-again to get the figures (matplotlib) next to the report.
+On the laptop (PowerShell), `.\sync-cluster.ps1 pull` copies the pipeline
+folder and writes the report again there, with the figures (matplotlib).
 
 ## Single runs
 
-On the laptop, in Git Bash, from `my_scripts/`:
+On the laptop, in PowerShell, from `my_scripts\`:
 
-```bash
-git add -A && git commit -m "..."     # push sends committed/tracked files
-bash sync-cluster.sh push             # code -> tapuz14:~/my_scripts
+```powershell
+.\sync-cluster.ps1 push               # code -> tapuz14:~/my_scripts (commit first for a clean VERSION)
 ```
 
 On tapuz14:
@@ -106,7 +109,10 @@ bash storage-bench.sh                 # storage stack alone
 ```
 
 `summary.txt` in each run folder holds the comparison table (`checks.txt` for
-the smoke test).
+the smoke test). `final-report.py <run folder>` writes a report with the
+figures that apply to a single run (1, 2 and 5): `python3 final-report.py ...`
+on the cluster, or on the laptop after `.\sync-cluster.ps1 pull`:
+`python experiments\storage_virtualization_loopback\final-report.py ..\storage_virtualization_loopback_tapuz\run_<date>`.
 
 ## CloudLab (c6620)
 
@@ -116,10 +122,10 @@ so a CloudLab run differs from a Tapuz run only in hardware.
 1. On a new reservation, update the node names in `clusters/c6620.conf` if they
    differ, then run `bash bootstrap-c6620.sh` once on node0 (symlinks
    `/scratch -> /mydata`, installs sysstat for iostat/pidstat/mpstat).
-2. Push from the laptop: `bash sync-cluster.sh push Mostufa@<node0 public name>`.
+2. Push from the laptop (PowerShell): `.\sync-cluster.ps1 push Mostufa@<node0 public name>`.
 3. On node0 the cluster is detected from the hostname (`CLUSTER=c6620`); run
    the same commands as on Tapuz (smoke test first).
-4. Pull: `bash sync-cluster.sh pull Mostufa@<node0 public name>`.
+4. Pull: `.\sync-cluster.ps1 pull Mostufa@<node0 public name>`.
 
 Use the internal names (node0..node4) inside the cluster, never the public
 er###.utah.cloudlab.us names (CloudLab rate-limits the control network).
@@ -210,7 +216,7 @@ cluster (`..._<cluster>_smoke/` for smoke tests):
 | `runs.csv` | one row per job (warm-up jobs have status `warmup`): k, repetition, position in the shuffled order, condition, runtime, input MB cached at start, other users' CPU % before the job, disk MB read/written, map counts, locality, map/reduce/CPU/GC time |
 | `dn_metrics.csv` | per job, from the DataNodes' own metrics: blocks and MB served, average time to serve one block, packet transfer time |
 | `server_metrics.csv` | per k and host: DataNode threads, memory (RSS, heap), open files; kernel loop/jbd2 threads; fs block size; DataNode start-to-first-block-report time and that report's size/timings; cluster setup and upload time |
-| `results.csv` | per-k summary read by `plot-results.py` (first condition; `results_<condition>.csv` per condition) |
+| `results.csv` | per-k summary: runtimes, NameNode memory, blocks per filesystem (first condition; `results_<condition>.csv` per condition) |
 | `metadata.json` | all settings, seed, protocol, code version, node hardware |
 | `configs/k<k>/` | the generated Hadoop configs of the master and one DataNode host |
 | `jobs/` | full output of every WordCount job |
@@ -255,7 +261,8 @@ container size and data-local share -- from the job counters in
 | `generate-single-dn-configs.sh` | Hadoop configs with k data dirs and the fixed YARN pool (runs on every node) |
 | `setup-loopback-fs.sh`, `teardown-loopback-fs.sh` | create/format/mount and remove the k images on one node |
 | `measure-fragmentation.sh`, `count-input-blocks-per-fs.sh` | filefrag and per-FS block counts |
-| `summarize-runs.py`, `analyze-counters.py`, `plot-results.py` | analysis |
+| `summarize-runs.py`, `analyze-counters.py` | comparison table and checks; job-counter table (also for old runs) |
+| `report_figures.py` | the five report figures (used by `final-report.py`) |
 | `experiment.conf` | the measured settings, shared by all clusters |
 | `cluster.conf`, `clusters/*.conf` | cluster selection, node names, paths |
 | `bootstrap-tapuz.sh`, `bootstrap-c6620.sh` | one-time checks / setup per cluster |
