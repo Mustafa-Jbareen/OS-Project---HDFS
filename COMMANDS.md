@@ -122,16 +122,62 @@ cd C:\Users\mostufa.j\Desktop\Dan\hadoop\my_scripts
 ```
 
 This copies the results to `hadoop\pipeline_<date>\` and writes
-`FINAL_REPORT.md` there, with the figures in `figures\`. It also works during
-a run, as a snapshot.
+`FINAL_REPORT.md` there, with the figures in `figures\`. The report goes into
+the newest pipeline or single-run folder that was copied. Pull also works
+during a run, as a snapshot.
 
-For a single run folder instead of a pipeline:
+For any other single run folder:
 
 ```powershell
 python experiments\storage_virtualization_loopback\final-report.py ..\storage_virtualization_loopback_tapuz\run_<date>
 ```
 
-## 8. Single runs instead of the pipeline
+## 8. After the pipeline: the large-input run (100 GB, 16 MB blocks)
+
+1. TAPUZ: check that the pipeline has finished. The last lines should say
+   `Finished after ... min` and list each stage's status.
+
+   ```bash
+   tail -n 15 /home/mostufa.j/my_scripts/results/pipeline_latest/pipeline.log
+   ```
+
+2. LOCAL: fetch it. This writes `hadoop\pipeline_<date>\FINAL_REPORT.md`
+   with the figures.
+
+   ```powershell
+   cd C:\Users\mostufa.j\Desktop\Dan\hadoop\my_scripts
+   .\sync-cluster.ps1 pull
+   ```
+
+3. LOCAL: send the code again. It contains `run-large-input.sh`, and push
+   only works once nothing is running.
+
+   ```powershell
+   .\sync-cluster.ps1 push
+   ```
+
+4. TAPUZ: start the run. `screen -r exp` returns to the finished session and
+   gives you a prompt; if that session is gone, use `screen -S exp`.
+
+   ```bash
+   screen -r exp
+   cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
+   bash run-large-input.sh          # 100 GB, 16 MB blocks, 3 repetitions: about 24 h
+   ```
+
+   Detach with **Ctrl+A, then D**. The script cleans `/scratch` itself.
+   For a shorter run use `K_VALUES="1 512 1024" bash run-large-input.sh`
+   (about 15 h). To watch it:
+
+   ```bash
+   tail -f $(ls -d /home/mostufa.j/my_scripts/results/storage_virtualization_loopback_tapuz_100GB_16MB/run_* | tail -1)/experiment.log
+   ```
+
+5. LOCAL, when it is done: `.\sync-cluster.ps1 pull`. The report and figures
+   go into
+   `hadoop\storage_virtualization_loopback_tapuz_100GB_16MB\run_<date>\`.
+
+## 9. Single runs instead of the pipeline
 
 TAPUZ, in the experiment folder, inside screen:
 
@@ -139,6 +185,7 @@ TAPUZ, in the experiment folder, inside screen:
 bash run-2x2.sh smoke                    # small 2x2, ~35 min, ends with READY / NOT READY
 bash run-2x2.sh                          # full 2x2: k = 1 64 256 512 1024, 5 repetitions
 bash storage-bench.sh                    # the storage stack alone, no Hadoop
+bash run-large-input.sh                  # 100 GB in 16 MB blocks, cold, full load (~24 h)
 K_VALUES="1 1024" bash run-2x2.sh 3      # any setting can be overridden like this
 ```
 

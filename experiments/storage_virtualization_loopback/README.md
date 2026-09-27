@@ -110,7 +110,14 @@ cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
 bash run-2x2.sh smoke                 # small 2x2; ends with READY / NOT READY
 bash run-2x2.sh                       # full 2x2: k = 1 64 256 512 1024
 bash storage-bench.sh                 # storage stack alone
+bash run-large-input.sh               # 100 GB in 16 MB blocks, cold, full load (~24 h)
 ```
+
+`run-large-input.sh` is the April-style run under the new protocol. The input
+is far larger than RAM (75 GB per worker), so it runs cold only, with no
+warm-up job. It cleans `/scratch` first and writes `checks.txt` and
+`FINAL_REPORT.md` at the end. Its results go to
+`results/storage_virtualization_loopback_<cluster>_100GB_16MB/`.
 
 `summary.txt` in each run folder holds the comparison table (`checks.txt` for
 the smoke test). `final-report.py <run folder>` writes a report with the

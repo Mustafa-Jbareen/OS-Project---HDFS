@@ -35,10 +35,12 @@ What is measured:
   - `/scratch` was cleaned, freeing 26 GB on tapuz14;
   - `bootstrap-tapuz.sh` passed on all 5 nodes, including the new page-cache
     test.
+- **Running:** `run-all.sh` was started on 2026-09-27: a smoke test that gates
+  the rest, then about 13 hours.
 - **Next:**
-  - start `run-all.sh`: a smoke test that gates the rest, then about 13 hours;
-  - then `.\sync-cluster.ps1 pull`, and write the conclusion from
-    `FINAL_REPORT.md`.
+  - `.\sync-cluster.ps1 pull`, then write the conclusion from `FINAL_REPORT.md`;
+  - then the large-input run, 100 GB in 16 MB blocks (`run-large-input.sh`,
+    about 24 h). The steps are in [COMMANDS.md](COMMANDS.md) section 8.
 - **CloudLab:** there is no reservation right now, so everything runs on Tapuz.
 
 ## What the old runs showed
@@ -166,6 +168,36 @@ The other stages:
 
 The whole pipeline takes about 13 h, or about 9 h with `--reps 3`.
 
+### Large-input run (`run-large-input.sh`, planned after the pipeline)
+
+This is the April-style experiment with the new protocol: a large input read
+from disk under full load.
+
+| Setting | Value |
+|---|---|
+| Input | 100 GB in 16 MB blocks = 6400 map tasks per job |
+| Data per worker | 75 GB of block files (3 replicas over 4 workers), far more than 7.7 GB of RAM |
+| Conditions | 8 maps per node, cold only (a warm cache can't exist at this size) |
+| k | 1, 64, 256, 512, 1024 (random order); same 200 GB budget and images as the main run |
+| Repetitions | 3 |
+| Warm-up job | none (`WARMUP_JOBS=0`) |
+| Results | `results/storage_virtualization_loopback_tapuz_100GB_16MB/run_<date>/` |
+| Time on Tapuz | ~24 h (~15 h with `K_VALUES="1 512 1024"`) |
+
+Why no warm-up job:
+
+- a warm-up job only absorbs a few seconds of first-job overhead, which is
+  negligible against ~80-minute jobs, and it would add about 6 hours;
+- each job's DataNode metrics still start at a snapshot taken just before it.
+
+At k=1024 each 200 MB filesystem holds about 5 blocks (75 MB).
+
+Time estimate, scaled from the April 40 GB / 16 MB run (30 min per job at
+k=1, 12 min upload, 9 min to generate the input):
+
+- about 25 minutes, once, to generate the input;
+- per k, a 30-minute upload plus 75-90 minutes per job.
+
 ### Loopback image sizes
 
 Each image is the budget divided by k (minimum 100 MB). Images exist only on
@@ -247,6 +279,7 @@ That is the layout every run before September 2026 used at k ≥ 512.
 | `run-2x2.sh` | the smoke test (`smoke`) or the full 2x2 on its own |
 | `run-experiment-loopback-fs.sh` | one run: every k, condition and repetition |
 | `storage-bench.sh` | the storage stack without Hadoop |
+| `run-large-input.sh` | the large-input run: 100 GB in 16 MB blocks, cold, full load |
 | `start-/stop-single-dn-cluster.sh`, `setup-/teardown-loopback-fs.sh`, `generate-single-dn-configs.sh` | cluster and virtual disks for one k |
 | `cache-step.py` | cold / warm / measure, on each DataNode host |
 | `summarize-runs.py` | comparison table; `--check` gives the smoke checks |

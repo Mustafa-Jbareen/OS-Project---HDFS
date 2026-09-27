@@ -17,7 +17,7 @@ USAGE
       Copies <RemoteDir>/results/<patterns> (default patterns: 'pipeline_2*
       storage_virtualization_loopback_* storage_bench_*') into the folder that
       holds my_scripts (hadoop\), then writes FINAL_REPORT.md with the figures
-      for the newest pipeline_* folder it copied. -ResultsDir pulls from
+      for the newest pipeline or single run it copied. -ResultsDir pulls from
       another folder on the host instead of <RemoteDir>/results.
 
   user@host defaults to mostufa.j@tapuz14.cslcs.technion.ac.il. On Tapuz ~ is
@@ -269,8 +269,23 @@ function Invoke-Pull {
     }
     if ($rc -ne 0) { Write-Failure $rc 'pull'; exit $rc }
     Write-Host "Copied into ${dest}: $($top -join ', ')"
-    $pipes = @($top | Where-Object { $_ -like 'pipeline_2*' })
-    if ($pipes.Count -gt 0) { Write-Report (Join-Path $dest $pipes[-1]) }
+    # Report on the newest pipeline or single run that came over; their names
+    # end in a timestamp that sorts (pipeline_2026-09-28_10-00-00, run_...).
+    $newest = $null
+    $newestStamp = ''
+    foreach ($t in $top) {
+        $found = @()
+        if ($t -like 'pipeline_2*') {
+            $found = @(Get-Item -LiteralPath (Join-Path $dest $t))
+        } elseif ($t -like 'storage_virtualization_loopback_*') {
+            $found = @(Get-ChildItem -LiteralPath (Join-Path $dest $t) -Directory -Filter 'run_2*' -ErrorAction SilentlyContinue)
+        }
+        foreach ($d in $found) {
+            $stamp = $d.Name -replace '^(pipeline|run)_', ''
+            if ([string]::CompareOrdinal($stamp, $newestStamp) -gt 0) { $newestStamp = $stamp; $newest = $d.FullName }
+        }
+    }
+    if ($newest) { Write-Report $newest }
 }
 
 if ($Action -notin @('push', 'pull')) { Show-Usage; exit 1 }
