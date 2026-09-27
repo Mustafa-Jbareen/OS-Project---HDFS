@@ -385,13 +385,12 @@ bash sync-cluster.sh push
 
 # tapuz14 (inside screen): the cluster is picked from the hostname (CLUSTER=tapuz|c6620)
 cd ~/my_scripts/experiments/storage_virtualization_loopback
-bash run-2x2.sh smoke                                        # tiny 2x2 with READY / NOT READY checks (~25 min)
-bash run-2x2.sh                                              # full load x cache test (~7-8 h)
+bash run-all.sh      # smoke test (gate) -> main run -> storage benchmark -> controls -> FINAL_REPORT.md (~13 h)
 K_VALUES="1 16 128 512 1024" bash run-experiment-loopback-fs.sh 5   # k sweep
 
 # laptop: fetch results and plot
 bash sync-cluster.sh pull
-python3 experiments/storage_virtualization_loopback/plot-results.py ../storage_virtualization_loopback_tapuz/run_<id>
+python3 experiments/storage_virtualization_loopback/final-report.py ../pipeline_<timestamp>
 ```
 
 Besides `results.csv` below, every run writes `runs.csv` (one row per job:

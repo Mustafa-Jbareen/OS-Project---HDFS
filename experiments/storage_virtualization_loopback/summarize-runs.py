@@ -259,7 +259,58 @@ def check(rows, meta, run_dir):
             level = "PASS" if local >= 70 else "WARN"
             add(level, f"{c}: {local:.0f}% of map tasks read their block locally")
 
-    # 6. swapping
+    # 6. measurements beyond runtime
+    dn_path = os.path.join(run_dir, "dn_metrics.csv")
+    dn_rows = []
+    if os.path.exists(dn_path):
+        with open(dn_path) as f:
+            dn_rows = [r for r in csv.DictReader(f) if r.get("status") == "ok"]
+    timed = [r for r in dn_rows if fnum(r, "dn_read_block_avg_ms", -1) > 0]
+    if not dn_rows:
+        add("WARN", "no DataNode metrics (dn_metrics.csv) -- DataNode JMX not reachable on port 9864?")
+    elif len(dn_rows) < len(ok):
+        add("WARN", f"DataNode metrics for only {len(dn_rows)} of {len(ok)} jobs")
+    else:
+        add("PASS", f"DataNode metrics for all {len(dn_rows)} jobs"
+                    + (" (time per block served available)" if timed else " (no per-block timing)"))
+
+    srv_path = os.path.join(run_dir, "server_metrics.csv")
+    srv = []
+    if os.path.exists(srv_path):
+        with open(srv_path) as f:
+            srv = list(csv.DictReader(f))
+    srv_ks = sorted({int(r["k"]) for r in srv})
+    if not srv:
+        add("WARN", "no server metrics (server_metrics.csv)")
+    else:
+        add("PASS" if srv_ks == ks else "WARN", f"server metrics for k = {', '.join(map(str, srv_ks))}")
+        sizes = {r.get("fs_block_size") for r in srv}
+        if meta.get("mkfs_mode") == "fixed" and len(sizes) > 1:
+            add("FAIL", f"loopback filesystems have different block sizes {sorted(sizes)} despite mkfs_mode=fixed")
+        else:
+            add("PASS", f"loopback filesystem block size: {', '.join(sorted(sizes))} bytes")
+
+    for tool in ("pidstat_datanode", "vmstat"):
+        logs = glob.glob(os.path.join(run_dir, "sysstat", f"{tool}_k*_*.log"))
+        samples = 0
+        for path in logs:
+            with open(path, errors="ignore") as f:
+                samples += sum(1 for line in f if line.split()[:1] and line.split()[0].isdigit())
+        if samples:
+            add("PASS", f"{tool} monitor: {samples} samples in {len(logs)} logs")
+        else:
+            add("WARN", f"{tool} monitor recorded nothing (is sysstat/procps installed on the workers?)")
+
+    others = [fnum(r, "other_users_cpu_pct", -1) for r in measured]
+    busy = [v for v in others if v > 50]
+    if others and max(others) < 0:
+        add("WARN", "other users' CPU not measured (pidstat missing)")
+    elif busy:
+        add("WARN", f"{len(busy)} job(s) started while other users' processes used >50% CPU on a DataNode host")
+    else:
+        add("PASS", f"no other users' load before the jobs (max {max(others, default=0):.0f}% CPU)")
+
+    # 7. swapping
     swaps = swap_activity(run_dir)
     if not swaps:
         add("WARN", "no vmstat logs found, swapping not checked")

@@ -66,6 +66,7 @@ echo "  Replication factor: $REPLICATION"
 echo "  Image size: ${IMAGE_SIZE_MB}MB per loopback FS"
 echo "  DN heap: ${DN_HEAP_MB}MB"
 echo "  YARN pool: ${SLOTS_PER_NODE} x ${CONTAINER_MB}MB per node"
+echo "  Loop devices: direct I/O=${LOOP_DIRECT_IO}, mkfs=${MKFS_MODE}"
 echo "============================================================"
 echo ""
 
@@ -87,10 +88,10 @@ declare -A SETUP_PIDS
 for node in "${DATANODE_NODES[@]}"; do
     echo "--- Starting setup on $node ---"
     if [[ "$node" == "$(hostname)" || "$node" == "$MASTER_NODE" ]]; then
-        bash "$SCRIPT_DIR/setup-loopback-fs.sh" "$K" "$IMAGE_SIZE_MB" "$IMAGE_DIR" "$MOUNT_BASE" > "/tmp/setup_${node}.log" 2>&1 &
+        bash "$SCRIPT_DIR/setup-loopback-fs.sh" "$K" "$IMAGE_SIZE_MB" "$IMAGE_DIR" "$MOUNT_BASE" "$LOOP_DIRECT_IO" "$MKFS_MODE" > "/tmp/setup_${node}.log" 2>&1 &
         SETUP_PIDS[$node]=$!
     else
-        ssh "$node" "bash /tmp/setup-loopback-fs.sh $K $IMAGE_SIZE_MB $IMAGE_DIR $MOUNT_BASE" > "/tmp/setup_${node}.log" 2>&1 &
+        ssh "$node" "bash /tmp/setup-loopback-fs.sh $K $IMAGE_SIZE_MB $IMAGE_DIR $MOUNT_BASE $LOOP_DIRECT_IO $MKFS_MODE" > "/tmp/setup_${node}.log" 2>&1 &
         SETUP_PIDS[$node]=$!
     fi
 done

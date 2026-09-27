@@ -11,10 +11,10 @@
 #       into ~/my_scripts on the host; new files must be `git add`-ed first.
 #       Existing files are overwritten; results/ and anything else already
 #       there is left alone.
-#   bash sync-cluster.sh pull [user@host] [pattern]
-#       Copies ~/my_scripts/results/<pattern> (default:
-#       storage_virtualization_loopback_*) into the folder that contains this
-#       repo, e.g. hadoop/storage_virtualization_loopback_tapuz/run_.../
+#   bash sync-cluster.sh pull [user@host] ['patterns']
+#       Copies ~/my_scripts/results/<patterns> (default: 'pipeline_2*
+#       storage_virtualization_loopback_* storage_bench_*') into the folder
+#       that contains this repo, e.g. hadoop/pipeline_<timestamp>/.
 #       Set REMOTE_RESULTS to pull from elsewhere (CloudLab wrapper runs write
 #       to /scratch/results).
 #
@@ -62,11 +62,26 @@ case "$cmd" in
         echo "Done. (experiments/storage_virtualization_loopback_tapuz/ on the cluster, if still there, is obsolete.)"
         ;;
     pull)
-        pattern=${3:-storage_virtualization_loopback_*}
+        patterns=${3:-"pipeline_2* storage_virtualization_loopback_* storage_bench_*"}
         remote_results=${REMOTE_RESULTS:-'~/my_scripts/results'}
         dest="$(cd "$REPO_DIR/.." && pwd)"
-        echo "Pulling $host:$remote_results/$pattern into $dest ..."
-        ssh "$host" "cd $remote_results && tar -czf - --exclude=latest $pattern" | tar -xzf - -C "$dest"
+        echo "Pulling $host:$remote_results/{$patterns} into $dest ..."
+        # shellcheck disable=SC2086  # patterns are expanded on the cluster
+        ssh "$host" "bash -s" -- "$remote_results" $patterns <<'REMOTE' | tar -xzf - -C "$dest"
+dir=$1
+shift
+cd "${dir/#\~/$HOME}" || { echo "no results folder $dir" >&2; exit 1; }
+shopt -s nullglob
+files=()
+for p in "$@"; do
+    for f in $p; do files+=("$f"); done
+done
+if (( ${#files[@]} == 0 )); then
+    echo "nothing on the cluster matches: $*" >&2
+    exit 1
+fi
+tar -czf - --exclude=latest --exclude=pipeline_latest "${files[@]}"
+REMOTE
         echo "Done."
         ;;
     *)

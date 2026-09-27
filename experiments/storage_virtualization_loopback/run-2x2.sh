@@ -13,12 +13,14 @@
 #   so they cannot tell which one hid the slowdown.
 #
 # USAGE:
-#   bash run-2x2.sh smoke      Tiny version (~25 min on tapuz): k=1 and k=4,
-#                              1 repetition, 1 GB input. Checks that every
-#                              part works (load levels, cold/warm cache,
-#                              counters, locality, swapping) and prints
+#   bash run-2x2.sh smoke      Small version (~35 min on tapuz): k=1 and k=4,
+#                              1 repetition, same input as the full run.
+#                              Checks that every part works (load levels,
+#                              cold/warm cache, counters, DataNode and server
+#                              metrics, locality, swapping) and prints
 #                              READY / NOT READY. Results go to
 #                              results/storage_virtualization_loopback_<cluster>_smoke/.
+#                              (run-all.sh runs this as its stage 1.)
 #   bash run-2x2.sh [K_REPS]   Full test: k = 1 64 256 512 1024 in random
 #                              order, K_REPS repetitions (default 5), 2 GB input.
 #                              About 7-8 hours on tapuz (K_REPS=3: ~5 hours).
@@ -40,12 +42,12 @@ MATRIX_INPUT_GB_DEFAULT=$(source "$SCRIPT_DIR/cluster.conf" && echo "$MATRIX_INP
 export CONDITIONS="${CONDITIONS:-maps=1,cache=cold maps=1,cache=warm maps=all,cache=cold maps=all,cache=warm}"
 
 if [[ "${1:-}" == "smoke" ]]; then
-    # 1 GB in 16 MB blocks = 64 map tasks: more than the 8 x 4 = 32 slots, so
-    # the full-load condition really fills the nodes. Small k values keep the
-    # cluster setup short (k=1024 alone takes ~25 min on tapuz).
+    # Same input and block size as the full run (2 GB in 32 MB blocks = 64 map
+    # tasks, more than the 8 x 4 = 32 slots), so the smoke checks -- above all
+    # whether warm runs keep the input in RAM -- predict the full run. Small k
+    # values keep the cluster setup short (k=1024 alone takes ~25 min on tapuz).
     export K_VALUES="${K_VALUES:-1 4}"
-    export INPUT_SIZE_MB="${INPUT_SIZE_MB:-1024}"
-    export BLOCK_SIZE_MB="${BLOCK_SIZE_MB:-16}"
+    export INPUT_SIZE_GB="${INPUT_SIZE_GB:-$MATRIX_INPUT_GB_DEFAULT}"
     export LOOPBACK_BUDGET_PER_NODE_GB="${LOOPBACK_BUDGET_PER_NODE_GB:-20}"
     export RESULTS_BASE="${RESULTS_BASE:-$PROJECT_ROOT/results/storage_virtualization_loopback_${CLUSTER_NAME}_smoke}"
 

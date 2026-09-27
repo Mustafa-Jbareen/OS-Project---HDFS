@@ -12,7 +12,82 @@ What the data shows so far, and why the scripts changed in September 2026:
 Everything runs on the cluster master (tapuz14 or CloudLab node0); the laptop
 only edits code and looks at results.
 
-## Quick start (Tapuz)
+## Tapuz checklist (exact commands)
+
+**LOCAL** = the laptop, in **Git Bash** (VS Code terminal -> Git Bash), not
+PowerShell. **TAPUZ** = logged in to tapuz14 (`ssh mostufa.j@tapuz14.cslcs.technion.ac.il`).
+
+1. LOCAL, once -- install the laptop's ssh key (asks the Tapuz password one
+   last time; the home folder is shared by all tapuz nodes):
+   ```bash
+   cat ~/.ssh/id_ed25519.pub | ssh mostufa.j@tapuz14.cslcs.technion.ac.il 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
+   ssh mostufa.j@tapuz14.cslcs.technion.ac.il hostname      # prints tapuz14, no password
+   ```
+2. TAPUZ, once -- put the old copy aside (nothing is deleted, old results included):
+   ```bash
+   mv ~/my_scripts ~/my_scripts_old_$(date +%F)
+   ```
+3. LOCAL -- send the code (again after every change; commit first):
+   ```bash
+   cd /c/Users/mostufa.j/Desktop/Dan/hadoop/my_scripts
+   bash sync-cluster.sh push
+   ```
+4. TAPUZ, once -- clean the nodes and check them:
+   ```bash
+   cd ~/my_scripts/experiments/storage_virtualization_loopback
+   bash stop-single-dn-cluster.sh 1024       # stop Hadoop, remove loopback disks on tapuz10-13
+   rm -f /scratch/tmp/wordcount_*MB.txt      # old input copies on tapuz14
+   bash bootstrap-tapuz.sh                   # ssh, sudo and tools on every node: no MISSING
+   for n in tapuz10 tapuz11 tapuz12 tapuz13; do ssh $n 'echo "$(hostname): $(df -BG --output=avail /scratch | tail -1) free, $(grep -c hdfs_loop /proc/mounts) loop mounts"'; done
+   ```
+   Each worker needs >= 205 GB free and 0 loop mounts.
+5. TAPUZ -- run everything (inside screen, so it survives logging out):
+   ```bash
+   screen -S exp
+   cd ~/my_scripts/experiments/storage_virtualization_loopback
+   bash run-all.sh                           # --reps 3 for ~9 h instead of ~13 h
+   ```
+   Detach with Ctrl+A then D; `screen -r exp` to come back;
+   `tail -f ~/my_scripts/results/pipeline_latest/pipeline.log` to watch.
+6. LOCAL -- when it is done:
+   ```bash
+   cd /c/Users/mostufa.j/Desktop/Dan/hadoop/my_scripts
+   bash sync-cluster.sh pull                 # -> hadoop/pipeline_<timestamp>/
+   python experiments/storage_virtualization_loopback/final-report.py ../pipeline_<timestamp>   # adds the figures
+   ```
+
+To stop a run (TAPUZ): `screen -r exp`, Ctrl+C, then
+`bash stop-single-dn-cluster.sh 1024`; continue later with
+`bash run-all.sh --from <stage>`.
+
+## Everything in one command: `run-all.sh`
+
+```bash
+cd ~/my_scripts/experiments/storage_virtualization_loopback
+screen -S exp                         # survives disconnects: Ctrl+A D, later screen -r exp
+bash run-all.sh                       # ~13 h on tapuz (--reps 3: ~9 h)
+```
+
+| Stage | What | If it fails |
+|---|---|---|
+| 0 clean | stop Hadoop, remove leftover loopback disks and old input copies | -- |
+| 1 smoke | the main run in small (k=1 and 4, 1 repetition, same input, conditions and protocol) + checks | **stops**: prints the failed checks, nothing long is started |
+| 2 main | load (1 / 4 / 8 maps per node) x cache (cold / warm) at k = 1 64 256 512 1024, random k order | stops (`--from 2` continues later) |
+| 3 bench | the storage stack alone, no Hadoop: 1 vs 8 readers x cold / warm at k = 1 256 1024 | noted, goes on |
+| 4 directio | control: loop devices with direct I/O, 8 maps/node cold + warm, k = 1 and 1024 | noted, goes on |
+| 5 mkfs | control: mkfs's default layout (as before Sept 2026), 8 maps/node cold, k = 1 and 1024 | noted, goes on |
+| 6 report | `FINAL_REPORT.md` from all stages; restore the normal cluster | -- |
+
+Everything goes to `results/pipeline_<timestamp>/` (`pipeline_latest` points
+to it): one folder per stage, `pipeline.log`, `stages.env`, `FINAL_REPORT.md`.
+`bash run-all.sh --from N` continues the latest pipeline at stage N;
+`--only N` runs one stage. Follow it with `tail -f ~/my_scripts/results/pipeline_latest/pipeline.log`.
+
+On the laptop: `bash sync-cluster.sh pull`, then run
+`python experiments/storage_virtualization_loopback/final-report.py ../pipeline_<timestamp>`
+again to get the figures (matplotlib) next to the report.
+
+## Single runs
 
 On the laptop, in Git Bash, from `my_scripts/`:
 
@@ -21,23 +96,16 @@ git add -A && git commit -m "..."     # push sends committed/tracked files
 bash sync-cluster.sh push             # code -> tapuz14:~/my_scripts
 ```
 
-On tapuz14, first the smoke test (~25 min), then the full run:
+On tapuz14:
 
 ```bash
 cd ~/my_scripts/experiments/storage_virtualization_loopback
-screen -S exp                         # survives disconnects: Ctrl+A D, later screen -r exp
-bash run-2x2.sh smoke                 # tiny 2x2; ends with READY / NOT READY
-bash run-2x2.sh                       # full 2x2: k = 1 64 256 512 1024, ~7-8 hours
+bash run-2x2.sh smoke                 # small 2x2; ends with READY / NOT READY
+bash run-2x2.sh                       # full 2x2: k = 1 64 256 512 1024
+bash storage-bench.sh                 # storage stack alone
 ```
 
-Back on the laptop:
-
-```bash
-bash sync-cluster.sh pull             # -> hadoop/storage_virtualization_loopback_tapuz[_smoke]/run_.../
-python experiments/storage_virtualization_loopback/plot-results.py ../storage_virtualization_loopback_tapuz/run_<id>
-```
-
-`summary.txt` in the run folder holds the comparison table (`checks.txt` for
+`summary.txt` in each run folder holds the comparison table (`checks.txt` for
 the smoke test).
 
 ## CloudLab (c6620)
@@ -72,6 +140,8 @@ with an environment variable in front of the command.
 | `SLOTS_PER_NODE`, `CONTAINER_MB` | 8 x 2048 | YARN pool per node (the load of the April runs that showed the slowdown) |
 | `DN_HEAP_MB` | 5500 | DataNode heap (MB or `auto`) |
 | `LOOPBACK_BUDGET_PER_NODE_GB` | 200 (smoke: 20) | disk space for all k images of one node |
+| `MKFS_MODE` | `fixed` | `fixed`: every image gets the same ext4 layout (4 KB blocks, one inode per 16 KB); `default`: mkfs decides from the image size (small images may get 1 KB blocks), as all runs before Sept 2026 |
+| `LOOP_DIRECT_IO` | 0 | 1 = loop devices with direct I/O (the image file is not cached a second time) |
 | `SETTLE_SECONDS` | 10 | pause before every measured job |
 | `WARMUP_JOBS` | 1 | untimed jobs after each cluster start |
 | `SEED` | current time | seed for all random orders (stored in metadata.json) |
@@ -137,7 +207,9 @@ cluster (`..._<cluster>_smoke/` for smoke tests):
 |---|---|
 | `summary.txt` | per condition and k: runtime mean/sd, change vs the smallest k with 95% CI, maps running at once, seconds per map, data-local %, share of the input cached at job start, disk MB read per job |
 | `checks.txt` | smoke test: PASS / WARN / FAIL per check and READY / NOT READY |
-| `runs.csv` | one row per job (warm-up jobs have status `warmup`): k, repetition, position in the shuffled order, condition, runtime, input MB cached at start, disk MB read/written, map counts, locality, map/reduce/CPU/GC time |
+| `runs.csv` | one row per job (warm-up jobs have status `warmup`): k, repetition, position in the shuffled order, condition, runtime, input MB cached at start, other users' CPU % before the job, disk MB read/written, map counts, locality, map/reduce/CPU/GC time |
+| `dn_metrics.csv` | per job, from the DataNodes' own metrics: blocks and MB served, average time to serve one block, packet transfer time |
+| `server_metrics.csv` | per k and host: DataNode threads, memory (RSS, heap), open files; kernel loop/jbd2 threads; fs block size; DataNode start-to-first-block-report time and that report's size/timings; cluster setup and upload time |
 | `results.csv` | per-k summary read by `plot-results.py` (first condition; `results_<condition>.csv` per condition) |
 | `metadata.json` | all settings, seed, protocol, code version, node hardware |
 | `configs/k<k>/` | the generated Hadoop configs of the master and one DataNode host |
@@ -173,7 +245,11 @@ container size and data-local share -- from the job counters in
 | Script | Purpose |
 |---|---|
 | `run-experiment-loopback-fs.sh` | main runner: per k, start cluster, upload, warm-up, all conditions x repetitions, collect metrics |
-| `run-2x2.sh` | the load x cache test (`smoke` = tiny version with checks) |
+| `run-all.sh` | the whole pipeline, stage by stage, gated by the smoke test |
+| `run-2x2.sh` | the load x cache test (`smoke` = small version with checks) |
+| `storage-bench.sh` | the same loopback disks read without Hadoop |
+| `final-report.py` | `FINAL_REPORT.md` (+ figures) from a pipeline folder |
+| `cache-step.py`, `node-info.sh`, `restore-base-cluster.sh` | node-side cache step, node description, restart of the normal cluster |
 | `start-single-dn-cluster.sh <k> <img_mb> <heap_mb> <repl>` | loopback setup, config generation on every node, start HDFS + YARN, verify |
 | `stop-single-dn-cluster.sh <max_k>` | stop Hadoop, tear down loopback filesystems (also after an aborted run) |
 | `generate-single-dn-configs.sh` | Hadoop configs with k data dirs and the fixed YARN pool (runs on every node) |

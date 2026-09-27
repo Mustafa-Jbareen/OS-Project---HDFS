@@ -81,18 +81,26 @@ NameNode.
   Tapuz), and on RAM-rich machines the fresh upload stayed in cache.
 - YARN pool and data locality as in section 2; nothing checked them.
 - Scripts had Windows line endings in the repository working copy.
+- The loopback images were formatted with mkfs.ext4's defaults, which depend
+  on the image size: below 512 MB (k >= 512 with a 200-220 GB budget) mkfs
+  may switch to 1 KB blocks and denser inodes. So at k=512 and k=1024 the
+  filesystem layout may have changed together with k -- exactly where the
+  April slowdown jumped. The main run now uses one fixed layout (4 KB blocks)
+  for every k and records the block size; a control stage repeats k=1 vs
+  1024 with the old default layout.
 - Earlier notes (NEXT_STEPS.md) said "HDD is 2x faster than SSD". That
   compared ARM m400 nodes with x86 Tapuz nodes on a CPU-heavy job, so it says
   little about the disks.
 
 ## 5. Next steps
 
-1. **The 2x2 test on Tapuz**: first `run-2x2.sh smoke` (~25 min, checks that
-   every part works), then `run-2x2.sh`: load (1 vs 8 maps per node) x cache
-   (cold vs warm) at k = 1, 64, 256, 512, 1024, conditions interleaved on one
-   cluster through an identical per-job protocol. If load is the cause, the
-   8-maps cells show roughly +10% at k=1024 and the 1-map cells show little,
-   cold or warm.
+1. **`run-all.sh` on Tapuz** (one command, ~13 h): smoke test (gate), then
+   load (1 / 4 / 8 maps per node) x cache (cold / warm) at k = 1, 64, 256,
+   512, 1024, conditions interleaved on one cluster through an identical
+   per-job protocol; then the storage stack without Hadoop, and two controls
+   (loop direct I/O; the old default mkfs layout); then `FINAL_REPORT.md`.
+   If load is the cause, the 8-maps cells show roughly +10% at k=1024 and the
+   1-map cells show little, cold or warm.
 2. Repeat it on c6620 when a reservation is available, with the same settings
    (they are shared by all clusters now), so only the hardware differs. Warm
    runs are clean there (plenty of RAM).

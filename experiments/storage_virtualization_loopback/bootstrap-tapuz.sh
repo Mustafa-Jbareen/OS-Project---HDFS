@@ -78,13 +78,20 @@ fi
 
 # ---- Step 3: report tooling presence ---------------------------------------
 echo ""
-echo "=== STEP 3: Tooling check (iostat, filefrag, bc, java, hadoop) ==="
+echo "=== STEP 3: Tooling check (monitors, filefrag, fincore, python3, bc, java, hadoop) ==="
 for node in "${ALL_NODES[@]}"; do
     echo "--- $node ---"
     ssh "$node" "HADOOP_HOME='$HADOOP_HOME' bash -s" <<'REMOTE'
 check() { command -v "$1" >/dev/null 2>&1 && echo "  $1: $(command -v "$1")" || echo "  $1: MISSING"; }
 check iostat
+check pidstat
+check mpstat
+check vmstat
 check filefrag
+check fincore
+check losetup
+check python3
+check curl
 check bc
 check java
 check sudo

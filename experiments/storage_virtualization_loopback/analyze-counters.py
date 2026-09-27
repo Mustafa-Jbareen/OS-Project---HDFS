@@ -13,6 +13,11 @@ Usage:
     analyze-counters.py --job-log FILE
         Prints "maps data_local map_ms reduce_ms cpu_ms gc_ms" for one job
         (used by run-experiment-loopback-fs.sh).
+    analyze-counters.py --dn-delta BEFORE.json AFTER.json
+        DataNode work between two DataNodeActivity snapshots (dn_snapshot in
+        the runner), summed over all DataNodes, as one CSV line:
+        read_ops,blocks_read,mb_read,read_block_avg_ms,packet_transfer_avg_us,
+        packet_blocked_on_network_avg_us,total_read_ms  (-1 = not available)
 
 Columns:
     conc        average number of map tasks running at once
@@ -129,7 +134,63 @@ def summarize_run(run_dir):
                   f"{map_s:>8.2f}{cpu_s:>8.2f}{cont:>9.0f}{local:>7.0f}%{red:>10.0f}{gc:>7.0f}")
 
 
+def dn_delta(before_path, after_path):
+    """Sum of DataNode work between two snapshots, over all DataNodes.
+
+    Counters (NumOps, BlocksRead, BytesRead, TotalReadTime) are cumulative:
+    their difference is the work in between. The *AvgTime values are
+    per-interval averages that the DataNode resets whenever its metrics are
+    read, so the value in the AFTER snapshot is the average over exactly the
+    operations since BEFORE; they are weighted by each DataNode's op count.
+    """
+    import json
+
+    with open(before_path) as f:
+        before = json.load(f)
+    with open(after_path) as f:
+        after = json.load(f)
+    ops = blocks = nbytes = 0
+    total_read_ms = 0
+    have_total_read = False
+    weighted = {"ReadBlockOp": [0.0, 0], "SendDataPacketTransferNanos": [0.0, 0],
+                "SendDataPacketBlockedOnNetworkNanos": [0.0, 0]}
+    for node, doc in after.items():
+        old_beans = {b.get("name"): b for b in before.get(node, {}).get("beans", [])}
+        for bean in doc.get("beans", []):
+            old = old_beans.get(bean.get("name"), {})
+
+            def diff(key):
+                return max(0, bean.get(key, 0) - old.get(key, 0))
+
+            ops += diff("ReadBlockOpNumOps")
+            blocks += diff("BlocksRead")
+            nbytes += diff("BytesRead")
+            if "TotalReadTime" in bean:
+                have_total_read = True
+                total_read_ms += diff("TotalReadTime")
+            for name, acc in weighted.items():
+                n = diff(name + "NumOps")
+                if n > 0:
+                    acc[0] += bean.get(name + "AvgTime", 0) * n
+                    acc[1] += n
+
+    def avg(name, scale=1.0):
+        s, n = weighted[name]
+        return f"{s / n * scale:.3f}" if n else "-1"
+
+    return ",".join([
+        str(ops), str(blocks), f"{nbytes / 1048576:.1f}",
+        avg("ReadBlockOp"),
+        avg("SendDataPacketTransferNanos", 1e-3),
+        avg("SendDataPacketBlockedOnNetworkNanos", 1e-3),
+        str(total_read_ms) if have_total_read else "-1",
+    ])
+
+
 def main(argv):
+    if len(argv) >= 3 and argv[0] == "--dn-delta":
+        print(dn_delta(argv[1], argv[2]))
+        return 0
     if len(argv) >= 2 and argv[0] == "--job-log":
         c = job_log_counters(argv[1])
         print(c["maps"], c["local"], c["map_ms"], c["red_ms"], c["cpu_ms"], c["gc_ms"])
