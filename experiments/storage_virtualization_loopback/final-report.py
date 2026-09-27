@@ -2,9 +2,10 @@
 """Final report of an experiment pipeline (run-all.sh).
 
 Usage:
-  final-report.py PIPELINE_DIR
-      Writes PIPELINE_DIR/FINAL_REPORT.md (and figures/*.png when matplotlib
-      is installed -- e.g. run it again on the laptop after pulling).
+  final-report.py PIPELINE_DIR | RUN_DIR
+      Writes FINAL_REPORT.md into the folder, plus figures/fig1..fig5 as PNG
+      and PDF when matplotlib is installed (e.g. run it again on the laptop
+      after pulling). A single run folder gets the sections that apply to it.
   final-report.py --bench-summary RUN_DIR
       Table of one storage-bench.sh run (used by storage-bench.sh).
 
@@ -275,11 +276,8 @@ def section_main(run, lines, figs):
         base = run.runtimes(c, run.ks[0])
         rows.append([c] + [fmt_change(*change(base, run.runtimes(c, k))) for k in run.ks[1:]])
     lines += md_table(["condition"] + [f"k={k}" for k in run.ks[1:]], rows) + [""]
-    if figs.enabled:
-        figs.change_vs_k("runtime_change_vs_k.png", "WordCount runtime vs k", run.ks,
-                         {c: [change(run.runtimes(c, run.ks[0]), run.runtimes(c, k)) for k in run.ks]
-                          for c in run.conditions})
-        lines += ["![runtime change vs k](figures/runtime_change_vs_k.png)", ""]
+    if figs.enabled and len(run.ks) >= 2:
+        figure_runtime(run, figs, lines)
 
 
 def section_factors(run, lines):
@@ -341,12 +339,7 @@ def section_where(run, lines, figs):
               "together while %sys rises, the extra cost sits in the storage path (DataNode + kernel); "
               "if only the map tasks' CPU time rises, it is contention on the node's CPU.", ""]
     if figs.enabled:
-        figs.metric_vs_k("map_task_time_vs_k.png", "Time per map task", "seconds", run.ks,
-                         {c: [mean(run.per_job(c, k, "avg_map_s")) for k in run.ks] for c in run.conditions})
-        figs.metric_vs_k("datanode_block_time_vs_k.png", "DataNode time per block served", "ms", run.ks,
-                         {c: [mean(run.dn_field(c, k, "dn_read_block_avg_ms")) for k in run.ks] for c in run.conditions})
-        lines += ["![map task time](figures/map_task_time_vs_k.png) "
-                  "![datanode block time](figures/datanode_block_time_vs_k.png)", ""]
+        figure_where(run, figs, lines)
 
 
 def section_server(run, lines, figs):
@@ -369,13 +362,7 @@ def section_server(run, lines, figs):
                            for _, f in cols])
     lines += md_table(["k"] + [c for c, _ in cols], rows) + [""]
     if figs.enabled:
-        ks = sorted(by_k)
-        figs.metric_vs_k("server_cost_vs_k.png", "DataNode cost vs k", "value", ks, {
-            "threads": [mean([fnum(r.get("dn_threads")) for r in by_k[k]]) for k in ks],
-            "RSS MB": [mean([fnum(r.get("dn_rss_mb")) for r in by_k[k]]) for k in ks],
-            "block report ms": [mean([fnum(r.get("block_report_rpc_ms")) for r in by_k[k]]) for k in ks],
-        }, logy=True)
-        lines += ["![server cost](figures/server_cost_vs_k.png)", ""]
+        figure_server(run, figs, lines)
 
 
 def bench_table(run_dir):
@@ -422,6 +409,8 @@ def section_bench(bench_dir, lines, figs):
         lines.append(f"- {readers} reader(s), {cache}: {fmt_change(pct, ci)} -- {verdict(ci, 'slower', 'faster')}")
     lines += ["", "If the storage stack alone slows down like the HDFS runs, the cost is in the kernel / "
               "loopback layer; if it does not, it is in HDFS (the DataNode).", ""]
+    if figs.enabled:
+        figure_bench(bench_dir, figs, lines)
 
 
 def section_control(main, other, title, what, lines):
@@ -453,63 +442,197 @@ def section_quality(run, lines):
 
 
 # ---------------------------------------------------------------- figures
-class Figures:
-    def __init__(self, out_dir):
+# Five figures, one per part of the conclusion (drawn by report_figures.py):
+#   fig1 runtime vs k, fig2 where the time goes, fig3 storage stack alone,
+#   fig4 controls, fig5 server cost vs k.
+CACHE_TITLES = {"cold": "Cold cache: input read from disk", "warm": "Warm cache: input already in RAM"}
+CACHE_SHORT = {"cold": "Cold cache", "warm": "Warm cache"}
+
+
+class FigureMaker:
+    def __init__(self, out_dir, meta):
         self.out_dir = out_dir
         try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-            self.plt = plt
-            self.enabled = True
+            import report_figures
+            self.rf = report_figures
             os.makedirs(out_dir, exist_ok=True)
-        except Exception:
+            self.enabled = True
+        except Exception as e:  # matplotlib missing (e.g. on the cluster)
+            self.rf = None
             self.enabled = False
+            self.why = str(e)
+        hosts = meta.get("datanode_hosts") or len(meta.get("datanode_host_names", []))
+        self.subtitle = (f"{meta.get('cluster', '?')}, {hosts} DataNode hosts; input {meta.get('input_size_mb', '?')} MB "
+                         f"in {meta.get('block_size_human', '?')} blocks; {meta.get('repetitions', '?')} jobs per point; "
+                         f"shaded band = 95% confidence interval")
 
-    def change_vs_k(self, name, title, ks, series):
-        plt = self.plt
-        fig, ax = plt.subplots(figsize=(8, 5))
-        for label, vals in series.items():
-            ys = [0 if i == 0 else (v[0] if v[0] is not None else float("nan")) for i, v in enumerate(vals)]
-            err = [[0 if i == 0 or not v[1] else v[0] - v[1][0] for i, v in enumerate(vals)],
-                   [0 if i == 0 or not v[1] else v[1][1] - v[0] for i, v in enumerate(vals)]]
-            ax.errorbar(ks, ys, yerr=err, marker="o", capsize=3, label=label)
-        ax.axhline(0, color="grey", linewidth=0.8)
-        ax.set_xscale("log", base=2)
-        ax.set_xlabel("k (virtual disks per DataNode)")
-        ax.set_ylabel(f"% change vs k={ks[0]}")
-        ax.set_title(title)
-        ax.legend()
-        fig.tight_layout()
-        fig.savefig(os.path.join(self.out_dir, name), dpi=130)
-        plt.close(fig)
+    def path(self, name):
+        return os.path.join(self.out_dir, name)
 
-    def metric_vs_k(self, name, title, ylabel, ks, series, logy=False):
-        plt = self.plt
-        fig, ax = plt.subplots(figsize=(8, 5))
-        for label, ys in series.items():
-            ax.plot(ks, [y if y is not None else float("nan") for y in ys], marker="o", label=label)
-        ax.set_xscale("log", base=2)
-        if logy and all(y and y > 0 for ys in series.values() for y in ys):
-            ax.set_yscale("log")
-        ax.set_xlabel("k (virtual disks per DataNode)")
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        ax.legend()
-        fig.tight_layout()
-        fig.savefig(os.path.join(self.out_dir, name), dpi=130)
-        plt.close(fig)
+
+def load_label(m):
+    return f"{m} map{'s' if m != 1 else ''}/node"
+
+
+def change_series(run, cond, values_fn, level=None, label=None):
+    """% change vs the smallest k, with 95% CI, as a report_figures series."""
+    maps, _ = run.cond_info(cond)
+    base = values_fn(cond, run.ks[0])
+    ys, los, his = [], [], []
+    for k in run.ks:
+        if k == run.ks[0]:
+            ys.append(0.0 if any(v is not None for v in base) else None)
+            los.append(0.0)
+            his.append(0.0)
+            continue
+        pct, ci = change(base, values_fn(cond, k))
+        ys.append(pct)
+        los.append(ci[0] if ci else None)
+        his.append(ci[1] if ci else None)
+    return {"level": level if level is not None else maps, "label": label or load_label(maps),
+            "x": list(run.ks), "y": ys, "lo": los, "hi": his}
+
+
+def conds_by_cache(run):
+    out = OrderedDict()
+    for cache in ("cold", "warm"):
+        conds = [c for c in run.conditions if run.cond_info(c)[1] == cache]
+        if conds:
+            out[cache] = conds
+    return out
+
+
+def figure_runtime(run, figs, lines):
+    groups = conds_by_cache(run)
+    cells = [[[change_series(run, c, run.runtimes) for c in conds] for conds in groups.values()]]
+    figs.rf.change_grid(figs.path("fig1_runtime_vs_k"), "WordCount runtime vs k", figs.subtitle, cells,
+                        run.ks, f"runtime change vs k={run.ks[0]}",
+                        col_titles=[CACHE_TITLES[c] for c in groups])
+    lines += ["![Figure 1: runtime vs k](figures/fig1_runtime_vs_k.png)", ""]
+
+
+def figure_where(run, figs, lines):
+    measures = [("Time per map task", lambda c, k: run.per_job(c, k, "avg_map_s")),
+                ("DataNode time per block served", lambda c, k: run.dn_field(c, k, "dn_read_block_avg_ms")),
+                ("CPU time per map task", run.cpu_per_map)]
+    groups = conds_by_cache(run)
+    cells = [[[change_series(run, c, fn) for c in conds] for _, fn in measures] for conds in groups.values()]
+    figs.rf.change_grid(figs.path("fig2_where_the_time_goes"), "Where the extra time goes", figs.subtitle,
+                        cells, run.ks, f"change vs k={run.ks[0]}",
+                        row_titles=[CACHE_SHORT[c] for c in groups], col_titles=[t for t, _ in measures],
+                        direct_labels=False, sharey="col")
+    lines += ["![Figure 2: where the time goes](figures/fig2_where_the_time_goes.png)", ""]
+
+
+def figure_bench(bench_dir, figs, lines):
+    rows = read_csv(os.path.join(bench_dir, "bench.csv"))
+    meta = read_json(os.path.join(bench_dir, "metadata.json"))
+    ks = sorted({int(r["k"]) for r in rows})
+    if len(ks) < 2:
+        return
+    secs = defaultdict(list)
+    for r in rows:
+        secs[(r["cache"], int(r["readers"]), int(r["k"]))].append(fnum(r["seconds"]))
+    cells, titles = [], []
+    for cache in ("cold", "warm"):
+        readers = sorted({rd for (c, rd, _) in secs if c == cache})
+        if not readers:
+            continue
+        series = []
+        for rd in readers:
+            base = secs[(cache, rd, ks[0])]
+            ys, los, his = [], [], []
+            for k in ks:
+                if k == ks[0]:
+                    ys.append(0.0)
+                    los.append(0.0)
+                    his.append(0.0)
+                    continue
+                pct, ci = change(base, secs[(cache, rd, k)])
+                ys.append(pct)
+                los.append(ci[0] if ci else None)
+                his.append(ci[1] if ci else None)
+            series.append({"level": rd, "label": f"{rd} reader{'s' if rd != 1 else ''}",
+                           "x": ks, "y": ys, "lo": los, "hi": his})
+        cells.append(series)
+        titles.append(CACHE_TITLES[cache])
+    subtitle = (f"{meta.get('cluster', '?')}; {meta.get('data_mb_per_host', '?')} MB per host in "
+                f"{meta.get('file_mb', '?')} MB files, read with plain parallel readers (no Hadoop); "
+                f"{meta.get('repetitions', '?')} reads x hosts per point; band = 95% CI")
+    figs.rf.change_grid(figs.path("fig3_storage_stack_alone"), "The storage stack alone: read time vs k",
+                        subtitle, [cells], ks, f"read time change vs k={ks[0]}", col_titles=titles)
+    lines += ["![Figure 3: storage stack alone](figures/fig3_storage_stack_alone.png)", ""]
+
+
+def figure_controls(main, dio, mkfs, figs, lines):
+    panels = []
+    for cache in ("cold", "warm"):
+        conds = [c for c in main.conditions if main.cond_info(c)[1] == cache]
+        if not conds:
+            continue
+        heavy = max(conds, key=lambda c: main.cond_info(c)[0])
+        rows = []
+        for label, run in (("Main run", main), ("Loop devices with direct I/O", dio),
+                           ("Default mkfs layout (pre-Sept 2026)", mkfs)):
+            if run and heavy in run.conditions and len(run.ks) >= 2:
+                pct, ci = run.change_k(heavy, run.runtimes)
+                rows.append((label, pct, ci[0] if ci else None, ci[1] if ci else None))
+        if len(rows) >= 2:
+            panels.append((f"{CACHE_TITLES[cache]} ({load_label(main.cond_info(heavy)[0])})", rows))
+    if not panels:
+        return
+    kmax = main.ks[-1]
+    figs.rf.controls(figs.path("fig4_controls"), f"Slowdown at k={kmax}: does it depend on how the disks were built?",
+                     f"Runtime change from k={main.ks[0]} to k={kmax} at the highest load; line = 95% CI",
+                     panels)
+    lines += ["![Figure 4: controls](figures/fig4_controls.png)", ""]
+
+
+def figure_server(run, figs, lines):
+    by_k = defaultdict(list)
+    for r in run.server:
+        by_k[int(r["k"])].append(r)
+    ks = sorted(by_k)
+    if len(ks) < 2:
+        return
+
+    def per_k(field):
+        return [mean([fnum(r.get(field)) for r in by_k[k]]) for k in ks]
+
+    nn_peak = []
+    for k in ks:
+        rows = read_csv(os.path.join(run.dir, "namenode_memory", f"nn_memory_k{k}.csv"))
+        vals = [fnum(r.get("heap_used_mb")) for r in rows]
+        vals = [v for v in vals if v]
+        nn_peak.append(max(vals) if vals else None)
+    panels = [("DataNode threads", per_k("dn_threads")),
+              ("DataNode memory, RSS (MB)", per_k("dn_rss_mb")),
+              ("NameNode heap, peak (MB)", nn_peak),
+              ("Block report: RPC + NameNode (ms)", per_k("block_report_rpc_ms")),
+              ("DataNode start to first block report (s)", per_k("dn_start_to_block_report_s")),
+              ("Input upload into HDFS (MB/s)", per_k("upload_mb_per_s"))]
+    figs.rf.small_multiples(figs.path("fig5_server_cost"), "What k virtual disks cost the server",
+                            f"{run.meta.get('cluster', '?')}; mean over the DataNode hosts, measured once per k "
+                            f"with the cluster idle", panels, ks)
+    lines += ["![Figure 5: server cost](figures/fig5_server_cost.png)", ""]
 
 
 # ---------------------------------------------------------------- main
 def report(pipe_dir):
-    stages = load_stages(pipe_dir)
+    """pipe_dir: a pipeline folder (stages.env) or a single run folder (runs.csv)."""
+    if os.path.exists(os.path.join(pipe_dir, "stages.env")):
+        stages = load_stages(pipe_dir)
+    elif os.path.exists(os.path.join(pipe_dir, "runs.csv")):
+        stages = {"MAIN_RUN": pipe_dir}
+    else:
+        print(f"{pipe_dir}: neither a pipeline folder (stages.env) nor a run folder (runs.csv)")
+        return 1
     main_dir = stages.get("MAIN_RUN")
     if not main_dir or not os.path.exists(os.path.join(main_dir, "runs.csv")):
         print(f"no main run in {pipe_dir}/stages.env")
         return 1
     main = Run(main_dir)
-    figs = Figures(os.path.join(pipe_dir, "figures"))
+    figs = FigureMaker(os.path.join(pipe_dir, "figures"), main.meta)
     lines = [
         "# Final report: k virtual disks per DataNode",
         "",
@@ -531,6 +654,8 @@ def report(pipe_dir):
     section_control(main, mkfs, "Default mkfs layout (as in all runs before September 2026)",
                     "Same conditions, but mkfs.ext4 picks the layout from the image size "
                     "(small images may get 1 KB blocks); the main run uses 4 KB blocks for every k.", lines)
+    if figs.enabled and (dio or mkfs):
+        figure_controls(main, dio, mkfs, figs, lines)
     section_quality(main, lines)
     failed = [s for s in ("SMOKE", "MAIN", "BENCH", "DIO", "MKFS") if stages.get(s + "_STATUS") == "failed"]
     if failed:
@@ -538,7 +663,8 @@ def report(pipe_dir):
     out = os.path.join(pipe_dir, "FINAL_REPORT.md")
     with open(out, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"Wrote {out}" + (" (with figures)" if figs.enabled else " (no matplotlib: no figures)"))
+    print(f"Wrote {out}" + (" (with figures in figures/, PNG + PDF)" if figs.enabled
+                            else " (no figures: matplotlib not available here; run it again on the laptop)"))
     return 0
 
 
