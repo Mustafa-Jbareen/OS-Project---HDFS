@@ -228,13 +228,15 @@ def check(rows, meta, run_dir):
             add("FAIL", f"load levels too close ({max(light):.1f} vs {min(heavy):.1f} maps at once)")
 
     # 4. cache state
+    in_ram = {}   # condition -> (cache mode, mean % of the input in RAM at job start, or None)
     for c, per_k in conds.items():
         rs = [r for v in per_k.values() for r in v]
         mode = rs[0]["cache"]
         disk = statistics.mean(fnum(r, "disk_read_mb") for r in rs)
         cps = [p for p in (cached_pct(r, meta) for r in rs) if p is not None]
         cached = statistics.mean(cps) if cps else None
-        cached_txt = f"{cached:.0f}% of the input cached at start" if cached is not None else "cached share n/a (no fincore)"
+        in_ram[c] = (mode, cached)
+        cached_txt = f"{cached:.0f}% of the input cached at start" if cached is not None else "cached share not measured"
         if input_mb <= 0:
             add("WARN", f"{c}: input size unknown (metadata.json), cache not checked")
             continue
@@ -250,6 +252,19 @@ def check(rows, meta, run_dir):
             else:
                 add("FAIL", f"{c}: read {disk:.0f} MB from disk per job (input {input_mb} MB) -- the input "
                             f"does not stay in RAM; use a smaller input for warm runs; {cached_txt}")
+
+    # 4b. the in-RAM measurement itself (cache-step.py measure on every DataNode host)
+    missing = [c for c, (_, pct) in in_ram.items() if pct is None]
+    off = [f"{c} {pct:.0f}%" for c, (mode, pct) in in_ram.items()
+           if pct is not None and ((mode == "cold" and pct > 20) or (mode == "warm" and pct < 50))]
+    if missing:
+        add("FAIL", f"share of the input in RAM at job start not measured for {', '.join(missing)} "
+                    "(cache-step.py measure failed on a DataNode host; try it there by hand)")
+    elif off:
+        add("FAIL", f"share of the input in RAM at job start does not match the cache condition: "
+                    f"{', '.join(off)} (cold should be ~0%, warm ~100%)")
+    elif in_ram:
+        add("PASS", "share of the input in RAM at job start measured and as intended (cold ~0%, warm ~100%)")
 
     # 5. locality
     for c, per_k in conds.items():

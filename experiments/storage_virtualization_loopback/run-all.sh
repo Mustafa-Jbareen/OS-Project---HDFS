@@ -4,7 +4,8 @@
 # DESCRIPTION: The whole experiment in one command. Stages run in order; the
 #              smoke test must pass (READY) before anything long starts.
 #
-#   0 clean     stop any Hadoop cluster, remove leftover loopback disks
+#   0 clean     clean-scratch.sh: stop any Hadoop cluster, remove leftover
+#               loopback disks, input copies, YARN caches and old logs
 #   1 smoke     small version of the main run (k=1 and 4, 1 repetition; same
 #               input, conditions and protocol) + checks.
 #               NOT READY -> print what failed and stop.
@@ -130,9 +131,8 @@ PIPE_T0=$(date +%s)
 
 # ---------------------------------------------------------------- stage 0
 if want_clean; then
-    stage_header "Stage 0: clean -- stop Hadoop, remove loopback disks, old input copies"
-    bash "$SCRIPT_DIR/stop-single-dn-cluster.sh" 1024 >> "$PLOG" 2>&1 || true
-    rm -f "$TMP_BASE"/wordcount_*MB.txt 2>/dev/null || true
+    stage_header "Stage 0: clean -- stop Hadoop, remove loopback disks and old leftovers in $STORAGE_BASE"
+    run_logged bash "$SCRIPT_DIR/clean-scratch.sh"
     plog "Stage 0 done."
 fi
 

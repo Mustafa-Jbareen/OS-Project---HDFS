@@ -701,18 +701,13 @@ prepare_job() {
 }
 
 # MB of HDFS block files (all replicas, all DataNode hosts) in the page cache
-# right now, from fincore (util-linux); -1 if fincore is missing.
+# right now (cache-step.py measure: mincore, the same on every cluster; it only
+# looks, nothing is read or evicted); -1 if a host could not measure.
 cached_input_mb() {
     local total=0 node mb
     for node in "${DATANODE_NODES[@]}"; do
-        mb=$(ssh "$node" "bash -s" -- "$MOUNT_BASE" <<'FCEOF' 2>/dev/null || true
-command -v fincore >/dev/null 2>&1 || { echo -1; exit 0; }
-find "$1"/dn*/hdfs_data -type f -name 'blk_*' -print0 2>/dev/null \
-    | xargs -0 -r fincore --bytes --noheadings --output RES 2>/dev/null \
-    | awk '{s += $1} END {printf "%d\n", s / 1048576}'
-FCEOF
-        )
-        if [[ -z "$mb" || "$mb" == "-1" ]]; then
+        mb=$(ssh "$node" "python3 /tmp/cache-step.py measure $MOUNT_BASE" 2>/dev/null || true)
+        if [[ ! "$mb" =~ ^[0-9]+$ ]]; then
             echo "-1"
             return
         fi

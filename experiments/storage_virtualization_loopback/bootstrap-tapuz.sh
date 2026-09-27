@@ -5,7 +5,9 @@
 #              - Verifies /scratch exists and we can sudo mkdir/chmod inside it;
 #                shows its free space and leftover loopback mounts
 #              - Verifies passwordless SSH between nodes
-#              - Reports presence of iostat, filefrag, bc, java, hadoop
+#              - Reports presence of iostat, filefrag, bc, java, hadoop, and
+#                tests the page-cache step on a 64 MB file (cache-step.py:
+#                read -> in RAM, evict -> not in RAM, measured with mincore)
 #              - Verifies the specific NOPASSWD sudo commands the experiment
 #                uses (mkfs.ext4, mount, umount, fallocate, losetup, mkdir,
 #                chmod, rmdir, rm)
@@ -83,17 +85,34 @@ fi
 
 # ---- Step 3: report tooling presence ---------------------------------------
 echo ""
-echo "=== STEP 3: Tooling check (monitors, filefrag, fincore, python3, bc, java, hadoop) ==="
+echo "=== STEP 3: Tooling check (monitors, filefrag, python3, bc, java, hadoop, page cache) ==="
 for node in "${ALL_NODES[@]}"; do
     echo "--- $node ---"
-    ssh "$node" "HADOOP_HOME='$HADOOP_HOME' bash -s" <<'REMOTE'
+    scp -q "$SCRIPT_DIR/cache-step.py" "$node:/tmp/cache-step.py" || true
+    ssh "$node" "HADOOP_HOME='$HADOOP_HOME' STORAGE_BASE='$STORAGE_BASE' bash -s" <<'REMOTE'
 check() { command -v "$1" >/dev/null 2>&1 && echo "  $1: $(command -v "$1")" || echo "  $1: MISSING"; }
+# The page-cache step the experiment runs before every job, on a 64 MB file:
+# after reading it should be in RAM, after evicting it should not be.
+cache_test() {
+    local d w c
+    d=$(mktemp -d "$STORAGE_BASE/tmp/cachetest.XXXXXX" 2>/dev/null || mktemp -d /tmp/cachetest.XXXXXX)
+    head -c 64M /dev/urandom > "$d/blk_test"
+    python3 /tmp/cache-step.py warm "$d" "$d" 'blk_*' >/dev/null 2>&1
+    w=$(python3 /tmp/cache-step.py measure "$d" 'blk_*' 2>&1)
+    python3 /tmp/cache-step.py cold "$d" "$d" 'blk_*' >/dev/null 2>&1
+    c=$(python3 /tmp/cache-step.py measure "$d" 'blk_*' 2>&1)
+    rm -rf "$d"
+    if [ "$w" -ge 60 ] 2>/dev/null && [ "$c" -le 4 ] 2>/dev/null; then
+        echo "  page cache: ok (64 MB test file: $w MB in RAM after reading, $c MB after evicting)"
+    else
+        echo "  page cache: FAIL (64 MB test file: '$w' MB in RAM after reading, '$c' MB after evicting)"
+    fi
+}
 check iostat
 check pidstat
 check mpstat
 check vmstat
 check filefrag
-check fincore
 check losetup
 check python3
 check curl
@@ -104,6 +123,11 @@ if [ -d "$HADOOP_HOME" ]; then
     echo "  hadoop: present at $HADOOP_HOME"
 else
     echo "  hadoop: MISSING at $HADOOP_HOME"
+fi
+if command -v python3 >/dev/null 2>&1 && [ -f /tmp/cache-step.py ]; then
+    cache_test
+else
+    echo "  page cache: MISSING (needs python3 and /tmp/cache-step.py)"
 fi
 REMOTE
 done

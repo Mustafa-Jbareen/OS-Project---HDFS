@@ -41,11 +41,14 @@ only edits code and looks at results.
 4. TAPUZ, once -- clean the nodes and check them:
    ```bash
    cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
-   bash stop-single-dn-cluster.sh 1024       # stop Hadoop, remove loopback disks on tapuz10-13
-   bash bootstrap-tapuz.sh                   # ssh, sudo, tools, free space and loop mounts per node
+   bash clean-scratch.sh                     # stop Hadoop; remove loopback disks and old leftovers in /scratch
+   bash bootstrap-tapuz.sh                   # ssh, sudo, tools, page cache, free space, loop mounts per node
    ```
    No line may say MISSING or FAIL. Each worker needs >= 205 GB free on
-   /scratch and 0 loopback mounts.
+   /scratch and 0 loopback mounts. `clean-scratch.sh` deletes only your own
+   files in the experiment's folders (input copies, Hadoop temp files and
+   logs, YARN caches, the experiment NameNode's metadata); stage 0 of
+   `run-all.sh` runs it again.
 5. TAPUZ -- run everything (inside screen, so it survives logging out):
    ```bash
    screen -S exp
@@ -76,7 +79,7 @@ bash run-all.sh                       # ~13 h on tapuz (--reps 3: ~9 h)
 
 | Stage | What | If it fails |
 |---|---|---|
-| 0 clean | stop Hadoop, remove leftover loopback disks and old input copies | -- |
+| 0 clean | `clean-scratch.sh`: stop Hadoop, remove leftover loopback disks, input copies, YARN caches and old logs | -- |
 | 1 smoke | the main run in small (k=1 and 4, 1 repetition, same input, conditions and protocol) + checks | **stops**: prints the failed checks, nothing long is started |
 | 2 main | load (1 / 4 / 8 maps per node) x cache (cold / warm) at k = 1 64 256 512 1024, random k order | stops (`--from 2` continues later) |
 | 3 bench | the storage stack alone, no Hadoop: 1 vs 8 readers x cold / warm at k = 1 256 1024 | noted, goes on |
@@ -199,7 +202,8 @@ container size depend on the condition:
    the Hadoop jars and filesystem metadata stay cached, so the modes differ
    only in the input data.
 4. Pause `SETTLE_SECONDS`.
-5. Record how much of the input is in the page cache (`fincore`) and the disk
+5. Record how much of the input is in the page cache (`cache-step.py measure`:
+   mincore, what `fincore` does; Tapuz has no `fincore`) and the disk
    counters, run and time the job, record the counters again.
 
 Around it: after every cluster start (one per k) the input is uploaded once,
