@@ -73,19 +73,20 @@ if ! [[ "$DN_HEAP_MB" =~ ^[0-9]+$ ]]; then
 fi
 
 # ---- Internal-network identity (CloudLab only) ---------------------------------
-# On CloudLab the experiment network is 10.10.x.x and /etc/hosts maps it to
-# node0..nodeN. Left alone, the NodeManager registers under the public name
-# (reverse DNS of eth0, e.g. er113.utah.cloudlab.us) and the DataNode under the
-# host's FQDN. YARN then cannot match block locations to nodes: the May 8/10
-# c6620 runs had 0% data-local maps. Pinning both daemons to the internal name
-# fixes registration and locality. Tapuz has no 10.10.x address, so nothing is
-# pinned there (same as the April runs, which had ~95% data-local maps).
+# On CloudLab the experiment network is 10.10.x.x, and /etc/hosts gives each
+# address several names: "10.10.1.2  node1-link-1 node1-0 node1". YARN can only
+# place a map next to its data if the DataNode and the NodeManager of a host
+# register under the same name. The NodeManager always registers under the
+# canonical name of its address (the reverse lookup: node1-link-1), so the
+# DataNode is pinned to that same name. Pinning the short name (node1) instead
+# gave 0% data-local maps, and YARN's wait for local slots that never came
+# kept only ~3 maps running at once (CloudLab smoke test, October 2026).
+# Tapuz has no 10.10.x address, so nothing is pinned there.
 LOCAL_INTERNAL_IP=$(ip -o -4 addr show 2>/dev/null \
     | awk '/inet 10\.10\./ {split($4,a,"/"); print a[1]; exit}' || true)
 LOCAL_INTERNAL_NAME=""
 if [[ -n "$LOCAL_INTERNAL_IP" ]]; then
-    LOCAL_INTERNAL_NAME=$(awk -v ip="$LOCAL_INTERNAL_IP" \
-        '$1==ip {print $NF; exit}' /etc/hosts 2>/dev/null || true)
+    LOCAL_INTERNAL_NAME=$(getent hosts "$LOCAL_INTERNAL_IP" 2>/dev/null | awk '{print $2; exit}' || true)
     LOCAL_INTERNAL_NAME=${LOCAL_INTERNAL_NAME:-$(hostname -s)}
 fi
 

@@ -271,8 +271,16 @@ def check(rows, meta, run_dir):
         rs = [r for v in per_k.values() for r in v]
         local = statistics.mean(100 * fnum(r, "data_local_maps") / max(fnum(r, "launched_maps"), 1) for r in rs)
         if maps_of.get(c, 1) > 1:
-            level = "PASS" if local >= 70 else "WARN"
-            add(level, f"{c}: {local:.0f}% of map tasks read their block locally")
+            if local >= 70:
+                add("PASS", f"{c}: {local:.0f}% of map tasks read their block locally")
+            elif local >= 30:
+                add("WARN", f"{c}: only {local:.0f}% of map tasks read their block locally")
+            else:
+                # Almost no local maps means YARN cannot match DataNodes to
+                # NodeManagers (different host names): maps read over the
+                # network, and YARN's wait for local slots also cuts the load.
+                add("FAIL", f"{c}: {local:.0f}% of map tasks read their block locally -- DataNodes and "
+                            "NodeManagers register under different host names")
 
     # 6. measurements beyond runtime
     dn_path = os.path.join(run_dir, "dn_metrics.csv")
