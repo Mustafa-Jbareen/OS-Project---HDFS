@@ -199,17 +199,71 @@ bash storage-bench.sh                    # the storage stack alone, no Hadoop
 K_VALUES="1 1024" bash run-2x2.sh 3      # any setting can be overridden like this
 ```
 
-## CloudLab (when reserved)
+## CloudLab (c6620, when reserved)
 
-On CloudLab `~` is the normal home. LOCAL:
+On CloudLab `~` is the normal home. **NODE0** = node0 of the experiment, after
+`ssh Mostufa@<node0 public name>` from PowerShell. The public names
+(`er###.utah.cloudlab.us`) are in the experiment's List View.
 
-```powershell
-.\sync-cluster.ps1 push Mostufa@<node0 public name> -RemoteDir '~/my_scripts'
-.\sync-cluster.ps1 pull Mostufa@<node0 public name> -RemoteDir '~/my_scripts'
-```
+1. **Website, once per laptop:** CloudLab only accepts registered ssh keys.
+   Show this laptop's public key with the LOCAL command below, then paste it
+   under *Manage SSH Keys* in the portal. Do this before starting the
+   experiment, so that its nodes get the key.
 
-On node0, run `bash bootstrap-c6620.sh` once. After that, use the same
-commands as on Tapuz, from `~/my_scripts/experiments/storage_virtualization_loopback`.
+   ```powershell
+   Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub
+   ```
+
+2. **Website: start the experiment** with the small-lan profile, or your own
+   profile with the same settings:
+   - number of nodes and hardware type exactly as in the reservation
+     (`c6620` -- watch out, `c6220` is a different machine);
+   - image `UBUNTU24-64-STD`;
+   - Advanced: *Temp Filesystem Max Space* checked, mount point `/mydata`;
+   - on the last page, the reservation's cluster (Cloudlab Utah) and project;
+   - a duration that ends before the reservation does.
+
+3. **LOCAL:** send the code to node0.
+
+   ```powershell
+   cd C:\Users\mostufa.j\Desktop\Dan\hadoop\my_scripts
+   .\sync-cluster.ps1 push Mostufa@<node0 public name> -RemoteDir '~/my_scripts'
+   ```
+
+4. **NODE0:** set up all nodes. This installs Java 11, Hadoop 3.3.6 (the same
+   as on Tapuz) and the tools, and links `/scratch` to `/mydata`. It takes
+   about 5-10 minutes and is safe to run again.
+
+   ```bash
+   cd ~/my_scripts/experiments/storage_virtualization_loopback
+   bash bootstrap-c6620.sh
+   ```
+
+   If its step 1 says FAIL (node0 cannot ssh to the other nodes), run this
+   on LOCAL with the 5 public names, node0 first, then run the script again:
+
+   ```powershell
+   $nodes = 'er101', 'er099', 'er127', 'er113', 'er080'
+   $pub = ssh "Mostufa@$($nodes[0]).utah.cloudlab.us" "test -f ~/.ssh/id_ed25519 || ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519; cat ~/.ssh/id_ed25519.pub"
+   foreach ($n in $nodes) { $pub | ssh "Mostufa@$n.utah.cloudlab.us" "tr -d '\r' >> ~/.ssh/authorized_keys" }
+   ```
+
+5. **NODE0:** run the pipeline, with the same settings as on Tapuz.
+
+   ```bash
+   screen -S exp
+   cd ~/my_scripts/experiments/storage_virtualization_loopback
+   bash run-all.sh
+   ```
+
+   Detach with Ctrl+A, then D. Watch it with
+   `tail -f ~/my_scripts/results/pipeline_latest/pipeline.log`.
+
+6. **LOCAL**, when it is done:
+
+   ```powershell
+   .\sync-cluster.ps1 pull Mostufa@<node0 public name> -RemoteDir '~/my_scripts'
+   ```
 
 ## If something goes wrong
 

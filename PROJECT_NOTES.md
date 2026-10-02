@@ -254,7 +254,7 @@ That is the layout every run before September 2026 used at k ≥ 512.
   - `~` is `/csl/mostufa.j`, the shared CSL network home. Don't use it.
   - Use `/home/mostufa.j` for everything:
     - the code, in `/home/mostufa.j/my_scripts`;
-    - Hadoop 3.3.1, in `/home/mostufa.j/hadoop`;
+    - Hadoop 3.3.6 with Java 11, in `/home/mostufa.j/hadoop`;
     - the ssh keys, in `/home/mostufa.j/.ssh`;
     - the normal cluster's HDFS data, in `/home/mostufa.j/hadoop_data`.
 - **`/scratch`** is the local HDD partition: 248 GB, with 236 GB free after

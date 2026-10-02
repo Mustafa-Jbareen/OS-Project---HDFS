@@ -850,7 +850,7 @@ def ts(s):
         return None
 t0, t1 = ts(start), ts(rep)
 m = re.search(r"containing (\d+) storage report", report_line)
-g = re.search(r"took (\d+) msec to generate and (\d+) msecs for RPC", report_line)
+g = re.search(r"took (\d+) msecs? to generate and (\d+) msecs? for RPC", report_line)
 upload = float(upload_s or 0)
 row = {
     "k": k, "node": node, "cluster_setup_s": setup_s, "upload_s": upload_s,

@@ -36,7 +36,7 @@ MOUNT_BASE=${3:-/scratch/hdfs_loop}
 DN_HEAP_MB=${4:-5500}
 REPLICATION=${5:-3}
 
-HADOOP_HOME="${HADOOP_HOME:-/scratch/hadoop/hadoop-3.3.1}"
+HADOOP_HOME="${HADOOP_HOME:?HADOOP_HOME must be set (export from caller)}"
 HADOOP_CONF="$HADOOP_HOME/etc/hadoop"
 MASTER_NODE="${MASTER_NODE:?MASTER_NODE must be set (export from caller)}"
 NAMENODE_PORT=9000
