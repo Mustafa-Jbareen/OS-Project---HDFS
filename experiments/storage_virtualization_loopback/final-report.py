@@ -146,8 +146,18 @@ def load_stages(pipe_dir):
         for line in open(path):
             if "=" in line:
                 k, v = line.strip().split("=", 1)
-                stages[k] = resolve_run(pipe_dir, v) if k.endswith("_RUN") else v
+                if k.endswith("_ADD_RUNS"):   # runs added with run-all.sh --add
+                    stages[k] = [resolve_run(pipe_dir, p) for p in v.split()]
+                else:
+                    stages[k] = resolve_run(pipe_dir, v) if k.endswith("_RUN") else v
     return stages
+
+
+def stage_run(stages, key):
+    """A stage's Run: its first run plus any runs added later (or None)."""
+    dirs = [d for d in [stages.get(f"{key}_RUN")] + stages.get(f"{key}_ADD_RUNS", [])
+            if d and os.path.exists(os.path.join(d, "runs.csv"))]
+    return Run(dirs) if dirs else None
 
 
 # ---------------------------------------------------------------- run data
@@ -173,27 +183,72 @@ def drop_scheduling_outliers(rows):
 
 
 class Run:
-    """One run of run-experiment-loopback-fs.sh."""
+    """A stage's run of run-experiment-loopback-fs.sh -- or its first run plus
+    the runs added later with run-all.sh --add. Every job keeps the index of
+    its run in "_run", and every k is compared with the smallest k of the same
+    run(s), so a k measured later is compared with that session's baseline."""
 
-    def __init__(self, run_dir):
-        self.dir = run_dir
-        self.meta = read_json(os.path.join(run_dir, "metadata.json"))
-        ok = [r for r in read_csv(os.path.join(run_dir, "runs.csv")) if r.get("status") == "ok"]
+    def __init__(self, run_dirs):
+        self.dirs = [run_dirs] if isinstance(run_dirs, str) else [d for d in run_dirs if d]
+        self.dir = self.dirs[0]
+        metas = [read_json(os.path.join(d, "metadata.json")) for d in self.dirs]
+        self.meta = dict(metas[0])
+        self.all_rows, self.server, self.dn = [], [], {}
+        for i, d in enumerate(self.dirs):
+            for r in read_csv(os.path.join(d, "runs.csv")):
+                r["_run"] = i
+                self.all_rows.append(r)
+            for r in read_csv(os.path.join(d, "dn_metrics.csv")):
+                self.dn[(i, r["k"], r["rep"], r["order_pos"], r["condition"])] = r
+            for r in read_csv(os.path.join(d, "server_metrics.csv")):
+                r["_run"] = i
+                self.server.append(r)
+        if len(self.dirs) > 1:
+            self.meta["k_values"] = sorted({int(k) for m in metas for k in m.get("k_values", [])})
+            self.meta["repetitions"] = ", ".join(
+                f"{m.get('repetitions', '?')} ({'first run' if i == 0 else 'added run'})" for i, m in enumerate(metas))
+        ok = [r for r in self.all_rows if r.get("status") == "ok"]
         self.rows, self.sched_outliers, self.conc_median = drop_scheduling_outliers(ok)
-        self.all_rows = read_csv(os.path.join(run_dir, "runs.csv"))
-        self.dn = {(r["k"], r["rep"], r["order_pos"], r["condition"]): r
-                   for r in read_csv(os.path.join(run_dir, "dn_metrics.csv"))}
-        self.server = read_csv(os.path.join(run_dir, "server_metrics.csv"))
         self.ks = sorted({int(r["k"]) for r in self.rows})
         self.conditions = list(OrderedDict.fromkeys(r["condition"] for r in self.rows))
         self._samples = None
+        self._only = None
 
     def cond_info(self, c):
         r = next(r for r in self.rows if r["condition"] == c)
         return int(r["maps_per_node"]), r["cache"]
 
     def jobs(self, c, k):
-        return [r for r in self.rows if r["condition"] == c and int(r["k"]) == k]
+        return [r for r in self.rows if r["condition"] == c and int(r["k"]) == k
+                and (self._only is None or r["_run"] in self._only)]
+
+    @contextlib.contextmanager
+    def only_runs(self, runs):
+        """Within the block, every value function sees only these runs' jobs."""
+        saved, self._only = self._only, set(runs)
+        try:
+            yield
+        finally:
+            self._only = saved
+
+    def base_values(self, c, k, values_fn):
+        """values_fn at the smallest k, from the run(s) that measured c at k.
+        Falls back to all runs if those have no job at the smallest k."""
+        runs = {r["_run"] for r in self.rows if r["condition"] == c and int(r["k"]) == k}
+        if len(self.dirs) > 1 and runs:
+            with self.only_runs(runs):
+                vals = values_fn(c, self.ks[0])
+            if any(v is not None for v in vals):
+                return vals
+        return values_fn(c, self.ks[0])
+
+    def find_file(self, *parts):
+        """The newest run's copy of a file (later runs win)."""
+        for d in reversed(self.dirs):
+            p = os.path.join(d, *parts)
+            if os.path.exists(p):
+                return p
+        return os.path.join(self.dir, *parts)
 
     def runtimes(self, c, k):
         return [fnum(r["runtime_s"]) for r in self.jobs(c, k)]
@@ -207,7 +262,7 @@ class Run:
     def dn_field(self, c, k, field):
         vals = []
         for r in self.jobs(c, k):
-            d = self.dn.get((r["k"], r["rep"], r["order_pos"], r["condition"]))
+            d = self.dn.get((r["_run"], r["k"], r["rep"], r["order_pos"], r["condition"]))
             v = fnum(d.get(field)) if d else None
             vals.append(v if v is not None and v >= 0 else None)
         return vals
@@ -215,14 +270,17 @@ class Run:
     def change_k(self, c, values_fn):
         if len(self.ks) < 2:
             return None, None
-        return change(values_fn(c, self.ks[0]), values_fn(c, self.ks[-1]))
+        k = self.ks[-1]
+        return change(self.base_values(c, k, values_fn), values_fn(c, k))
 
-    # monitor samples (pidstat: epoch; vmstat: UTC) assigned to jobs
+    # monitor samples (pidstat: epoch; vmstat: UTC) assigned to jobs by time
     def samples(self):
         if self._samples is not None:
             return self._samples
         pid, vm = defaultdict(list), defaultdict(list)
-        for path in glob.glob(os.path.join(self.dir, "sysstat", "pidstat_datanode_k*_*.log")):
+        pid_logs = [p for d in self.dirs for p in glob.glob(os.path.join(d, "sysstat", "pidstat_datanode_k*_*.log"))]
+        vm_logs = [p for d in self.dirs for p in glob.glob(os.path.join(d, "sysstat", "vmstat_k*_*.log"))]
+        for path in pid_logs:
             k = int(os.path.basename(path).split("_k")[1].split("_")[0])
             cols = None
             for line in open(path, errors="ignore"):
@@ -233,7 +291,7 @@ class Run:
                 if cols and t and t[0].isdigit() and len(t) >= len(cols):
                     rec = dict(zip(cols, t))
                     pid[k].append((int(t[0]), fnum(rec.get("%CPU")), fnum(rec.get("RSS"))))
-        for path in glob.glob(os.path.join(self.dir, "sysstat", "vmstat_k*_*.log")):
+        for path in vm_logs:
             k = int(os.path.basename(path).split("_k")[1].split("_")[0])
             cols = None
             for line in open(path, errors="ignore"):
@@ -289,6 +347,44 @@ def section_setup(run, lines):
     ]
 
 
+def section_combined(named_runs, lines):
+    """For stages with runs added later (run-all.sh --add): which run measured
+    which k, and whether the smallest k -- measured in both -- moved between
+    the sessions. Each k is compared with the smallest k of its own run."""
+    combined = [(name, run) for name, run in named_runs if run is not None and len(run.dirs) > 1]
+    if not combined:
+        return
+    lines += ["## Runs combined", "",
+              "Some stages were measured in more than one session (run-all.sh --add). Each k is compared "
+              "with the smallest k of its own session; the table shows whether that baseline moved between "
+              "the sessions (a clear difference means the cluster drifted).", ""]
+    for name, run in combined:
+        k0 = run.ks[0]
+        lines += [f"**{name}**", ""]
+        for i, d in enumerate(run.dirs):
+            ks_i = sorted({int(r["k"]) for r in run.rows if r["_run"] == i})
+            start = read_json(os.path.join(d, "metadata.json")).get("start_time", "?")
+            lines.append(f"- {'first run' if i == 0 else 'added run'} `{os.path.basename(d)}` "
+                         f"(started {start}): k = {', '.join(str(k) for k in ks_i) or 'none'}")
+        lines.append("")
+        rows = []
+        for c in run.conditions:
+            with run.only_runs({0}):
+                first = run.runtimes(c, k0)
+            for i in range(1, len(run.dirs)):
+                with run.only_runs({i}):
+                    added = run.runtimes(c, k0)
+                if first and added:
+                    pct, ci = change(first, added)
+                    rows.append([c, f"{mean(first):.1f} s (n={len(first)})", f"{mean(added):.1f} s (n={len(added)})",
+                                 f"{fmt_change(pct, ci)} -- {verdict(ci, 'slower now', 'faster now')}"])
+                else:
+                    rows.append([c, fmt(mean(first), 1), fmt(mean(added), 1),
+                                 f"not measured in both: the added k values are compared with the first run's k={k0}"])
+        lines += md_table(["condition", f"k={k0}, first run", f"k={k0}, added run", "added vs first [95% CI]"], rows)
+        lines.append("")
+
+
 def section_main(run, lines, figs):
     lines += ["## 1. Runtime vs k", ""]
     missing = [k for k in run.meta.get("k_values", []) if k not in run.ks]
@@ -309,8 +405,8 @@ def section_main(run, lines, figs):
     lines += ["Change vs k=%d (95%% CI):" % run.ks[0], ""]
     rows = []
     for c in run.conditions:
-        base = run.runtimes(c, run.ks[0])
-        rows.append([c] + [fmt_change(*change(base, run.runtimes(c, k))) for k in run.ks[1:]])
+        rows.append([c] + [fmt_change(*change(run.base_values(c, k, run.runtimes), run.runtimes(c, k)))
+                           for k in run.ks[1:]])
     lines += md_table(["condition"] + [f"k={k}" for k in run.ks[1:]], rows) + [""]
     if run.sched_outliers:
         lines += [f"Left out: {len(run.sched_outliers)} job(s) in which YARN ran clearly fewer maps at once "
@@ -367,9 +463,9 @@ def section_where(run, lines, figs):
     rows = []
     for c in run.conditions:
         def pair(values_fn, digits=2):
-            a, b = mean(values_fn(c, k0)), mean(values_fn(c, k1))
-            pct, ci = change(values_fn(c, k0), values_fn(c, k1))
-            return f"{fmt(a, digits)} -> {fmt(b, digits)} ({fmt_change(pct, ci)})"
+            base, vals = run.base_values(c, k1, values_fn), values_fn(c, k1)
+            pct, ci = change(base, vals)
+            return f"{fmt(mean(base), digits)} -> {fmt(mean(vals), digits)} ({fmt_change(pct, ci)})"
         rows.append([
             c,
             pair(lambda c_, k: run.per_job(c_, k, "avg_map_s")),
@@ -480,11 +576,14 @@ def section_control(main, other, title, what, lines):
 
 def section_quality(run, lines):
     lines += ["## 7. Data quality (main run)", ""]
-    buf = io.StringIO()
-    rows_all, meta = sr.load(run.dir)
-    with contextlib.redirect_stdout(buf):
-        sr.check(rows_all, meta, run.dir)
-    lines += ["```"] + [l for l in buf.getvalue().splitlines() if l.strip()] + ["```", ""]
+    for i, d in enumerate(run.dirs):
+        if len(run.dirs) > 1:
+            lines += [f"{'First run' if i == 0 else 'Added run'} `{os.path.basename(d)}`:", ""]
+        buf = io.StringIO()
+        rows_all, meta = sr.load(d)
+        with contextlib.redirect_stdout(buf):
+            sr.check(rows_all, meta, d)
+        lines += ["```"] + [l for l in buf.getvalue().splitlines() if l.strip()] + ["```", ""]
 
 
 # ---------------------------------------------------------------- figures
@@ -531,7 +630,7 @@ def change_series(run, cond, values_fn, level=None, label=None):
             los.append(0.0)
             his.append(0.0)
             continue
-        pct, ci = change(base, values_fn(cond, k))
+        pct, ci = change(run.base_values(cond, k, values_fn), values_fn(cond, k))
         ys.append(pct)
         los.append(ci[0] if ci else None)
         his.append(ci[1] if ci else None)
@@ -647,7 +746,7 @@ def figure_server(run, figs, lines):
 
     nn_peak = []
     for k in ks:
-        rows = read_csv(os.path.join(run.dir, "namenode_memory", f"nn_memory_k{k}.csv"))
+        rows = read_csv(run.find_file("namenode_memory", f"nn_memory_k{k}.csv"))
         vals = [fnum(r.get("heap_used_mb")) for r in rows]
         vals = [v for v in vals if v]
         nn_peak.append(max(vals) if vals else None)
@@ -673,11 +772,10 @@ def report(pipe_dir):
     else:
         print(f"{pipe_dir}: neither a pipeline folder (stages.env) nor a run folder (runs.csv)")
         return 1
-    main_dir = stages.get("MAIN_RUN")
-    if not main_dir or not os.path.exists(os.path.join(main_dir, "runs.csv")):
+    main = stage_run(stages, "MAIN")
+    if main is None:
         print(f"no main run in {pipe_dir}/stages.env")
         return 1
-    main = Run(main_dir)
     figs = FigureMaker(os.path.join(pipe_dir, "figures"), main.meta)
     lines = [
         "# Final report: k virtual disks per DataNode",
@@ -686,15 +784,16 @@ def report(pipe_dir):
         "Numbers in brackets are 95% confidence intervals; \"clearly\" means the interval excludes zero.",
         "",
     ]
+    dio = stage_run(stages, "DIO")
+    mkfs = stage_run(stages, "MKFS")
     section_setup(main, lines)
+    section_combined([("Main run", main), ("Direct-I/O control", dio), ("Default-mkfs control", mkfs)], lines)
     section_main(main, lines, figs)
     section_factors(main, lines)
     section_where(main, lines, figs)
     section_server(main, lines, figs)
     section_bench(stages.get("BENCH_RUN"), lines, figs)
     lines += ["## 6. Controls: is it an artifact of how the virtual disks were built?", ""]
-    dio = Run(stages["DIO_RUN"]) if stages.get("DIO_RUN") else None
-    mkfs = Run(stages["MKFS_RUN"]) if stages.get("MKFS_RUN") else None
     section_control(main, dio, "Loop devices with direct I/O (no second cached copy of the data)",
                     "Same conditions, but the loop devices bypass the page cache for the image files.", lines)
     section_control(main, mkfs, "Default mkfs layout (as in all runs before September 2026)",

@@ -23,8 +23,12 @@
 #   bash run-all.sh --reps 3        3 repetitions               (~9 h)
 #   bash run-all.sh --from 3        continue the latest pipeline at stage 3
 #   bash run-all.sh --only 1        run a single stage (1 = just the smoke test)
+#   bash run-all.sh --only 2,4,6    run several stages
 #   bash run-all.sh --input-gb 100 --block-mb 16 --reps 3
 #                                   the same pipeline with another input (below)
+#   MAIN_K_VALUES="1 1024" bash run-all.sh --pipeline <folder> --only 2,4,5,6 --add
+#                                   measure more k values for an existing
+#                                   pipeline and add them to it (below)
 #
 # Stages 1 and 2 are required: if either fails the pipeline stops. Stages 3-5
 # are extras: a failure is noted and the pipeline goes on to the report.
@@ -39,6 +43,13 @@
 # control run cold only. The folder is then named
 # pipeline_<timestamp>_<N>GB_<M>MB. --from and --only continue a pipeline
 # with the input it was started with.
+#
+# ADDING TO A PIPELINE: --from/--only continue the latest pipeline, or the one
+# named with --pipeline (a folder in results/). Normally a stage that runs
+# again replaces the stage's run in the report. With --add the new run is
+# recorded next to the earlier one (stages.env: <STAGE>_ADD_RUNS), and the
+# report combines them. Include k=1 in the added k values: it shows whether
+# the cluster drifted since the first run.
 #
 # OUTPUT: results/pipeline_<timestamp>/ with 1_smoke/ 2_main/ 3_bench/
 #         4_directio/ 5_mkfs/ figures/ FINAL_REPORT.md pipeline.log stages.env
@@ -60,19 +71,30 @@ FROM=0
 ONLY=""
 INPUT_GB=""
 BLOCK_MB=""
+PIPELINE=""
+ADD=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --reps) REPS=${2:?"--reps needs a number"}; shift 2 ;;
         --from) FROM=${2:?"--from needs a stage number"}; shift 2 ;;
-        --only) ONLY=${2:?"--only needs a stage number"}; shift 2 ;;
+        --only) ONLY=${2:?"--only needs a stage number or a list like 2,4,6"}; shift 2 ;;
         --input-gb) INPUT_GB=${2:?"--input-gb needs a size in GB"}; shift 2 ;;
         --block-mb) BLOCK_MB=${2:?"--block-mb needs a size in MB"}; shift 2 ;;
+        --pipeline) PIPELINE=${2:?"--pipeline needs a folder name in results/"}; shift 2 ;;
+        --add) ADD=1; shift ;;
         -h|--help) sed -n '2,/^####/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; /^###/d'; exit 0 ;;
         *) echo "unknown argument: $1 (see --help)" >&2; exit 1 ;;
     esac
 done
-for v in "$REPS" "$FROM" "${ONLY:-0}" "${INPUT_GB:-1}" "${BLOCK_MB:-1}"; do
-    [[ "$v" =~ ^[0-9]+$ ]] || { echo "--reps/--from/--only/--input-gb/--block-mb need a number" >&2; exit 1; }
+IFS=',' read -r -a ONLY_STAGES <<< "$ONLY"
+for v in "$REPS" "$FROM" "${INPUT_GB:-1}" "${BLOCK_MB:-1}" "${ONLY_STAGES[@]}"; do
+    [[ "$v" =~ ^[0-9]+$ ]] || { echo "--reps/--from/--only/--input-gb/--block-mb need numbers" >&2; exit 1; }
+done
+ONLY_MIN=9
+ONLY_MAX=0
+for v in "${ONLY_STAGES[@]}"; do
+    (( v < ONLY_MIN )) && ONLY_MIN=$v
+    (( v > ONLY_MAX )) && ONLY_MAX=$v
 done
 
 MAIN_K=${MAIN_K_VALUES:-"1 64 256 512 1024"}
@@ -84,12 +106,25 @@ BENCH_REPS=${BENCH_REPS:-3}
 RESULTS_ROOT="$PROJECT_ROOT/results"
 continue_latest=0
 if (( FROM >= 2 )); then continue_latest=1; fi
-if [[ -n "$ONLY" ]] && (( ONLY >= 2 )); then continue_latest=1; fi
+if [[ -n "$ONLY" ]] && (( ONLY_MAX >= 2 )); then continue_latest=1; fi
+if (( ! continue_latest )) && [[ -n "$PIPELINE" || "$ADD" == 1 ]]; then
+    echo "--pipeline and --add work on an existing pipeline: use them with --from or --only (stage 2 or later)." >&2
+    exit 1
+fi
 if (( continue_latest )); then
-    PIPE_DIR=$(ls -d "$RESULTS_ROOT"/pipeline_2* 2>/dev/null | sort | tail -1 || true)
-    if [[ -z "$PIPE_DIR" ]]; then
-        echo "No earlier pipeline in $RESULTS_ROOT to continue." >&2
-        exit 1
+    if [[ -n "$PIPELINE" ]]; then
+        PIPE_DIR=${PIPELINE%/}
+        [[ "$PIPE_DIR" == /* ]] || PIPE_DIR="$RESULTS_ROOT/$PIPE_DIR"
+        if [[ ! -f "$PIPE_DIR/stages.env" ]]; then
+            echo "No pipeline at $PIPE_DIR (no stages.env there)." >&2
+            exit 1
+        fi
+    else
+        PIPE_DIR=$(ls -d "$RESULTS_ROOT"/pipeline_2* 2>/dev/null | sort | tail -1 || true)
+        if [[ -z "$PIPE_DIR" ]]; then
+            echo "No earlier pipeline in $RESULTS_ROOT to continue." >&2
+            exit 1
+        fi
     fi
     # Continue with the input the pipeline was started with.
     rec_in=$(grep -m1 '^PIPE_INPUT_GB=' "$PIPE_DIR/stages.env" 2>/dev/null | cut -d= -f2 || true)
@@ -159,13 +194,27 @@ latest_run() {
     ls -d "$1"/run_* 2>/dev/null | sort | tail -1 || true
 }
 want() {
-    if [[ -n "$ONLY" ]]; then [[ "$1" == "$ONLY" ]]; else (( $1 >= FROM )); fi
+    if [[ -n "$ONLY" ]]; then [[ ",$ONLY," == *",$1,"* ]]; else (( $1 >= FROM )); fi
 }
 # Cleaning is cheap and every Hadoop stage needs it (leftover loopback images
 # of an aborted run would fail the free-space check), so it runs before
 # stages 1 and 2 however they are started.
 want_clean() {
-    if [[ -n "$ONLY" ]]; then (( ONLY <= 2 )); else (( FROM <= 2 )); fi
+    if [[ -n "$ONLY" ]]; then (( ONLY_MIN <= 2 )); else (( FROM <= 2 )); fi
+}
+# Record a stage's run in stages.env: KEY_RUN and KEY_STATUS, or with --add
+# appended to KEY_ADD_RUNS (the report combines those with KEY_RUN).
+record_run() {
+    local key=$1 dir=$2 status=$3 rel old
+    rel=${dir#"$PIPE_DIR"/}
+    if (( ADD )); then
+        old=$(grep -m1 "^${key}_ADD_RUNS=" "$PIPE_DIR/stages.env" | cut -d= -f2- || true)
+        [[ -n "$dir" && " $old " != *" $rel "* ]] && set_stage "${key}_ADD_RUNS" "${old:+$old }$rel"
+        set_stage "${key}_ADD_STATUS" "$status"
+    else
+        set_stage "${key}_RUN" "$rel"
+        set_stage "${key}_STATUS" "$status"
+    fi
 }
 # Run a stage command with its output on screen and in pipeline.log.
 # Sets STAGE_RC.
@@ -230,19 +279,20 @@ fi
 
 # ---------------------------------------------------------------- stage 2
 if want 2; then
-    stage_header "Stage 2: main run (k = $MAIN_K, random order, $REPS repetitions)"
+    stage_header "Stage 2: main run (k = $MAIN_K, random order, $REPS repetitions)$( (( ADD )) && echo ', added to the earlier run')"
+    before=$(latest_run "$PIPE_DIR/2_main")
     run_logged env RESULTS_BASE="$PIPE_DIR/2_main" CONDITIONS="$CONDITIONS_MAIN" K_VALUES="$MAIN_K" K_ORDER=random \
         INPUT_SIZE_GB="$INPUT_GB" BLOCK_SIZE_MB="$BLOCK_MB" \
         bash "$SCRIPT_DIR/run-2x2.sh" "$REPS"
     run_dir=$(latest_run "$PIPE_DIR/2_main")
-    set_stage MAIN_RUN "${run_dir#"$PIPE_DIR"/}"
+    [[ "$run_dir" == "$before" ]] && run_dir=""
     if (( STAGE_RC != 0 )) || [[ -z "$run_dir" ]]; then
-        set_stage MAIN_STATUS failed
+        record_run MAIN "$run_dir" failed
         plog "STOPPED: the main run failed (exit $STAGE_RC). See $PLOG and ${run_dir:-$PIPE_DIR/2_main}."
-        plog "Continue later from this stage with: bash run-all.sh --from 2"
+        plog "After fixing the problem, run the same command again (bash run-all.sh --from 2 continues at this stage)."
         exit 1
     fi
-    set_stage MAIN_STATUS ok
+    record_run MAIN "$run_dir" ok
     if python3 "$SCRIPT_DIR/summarize-runs.py" "$run_dir" --check > "$run_dir/checks.txt" 2>&1; then
         plog "Stage 2 done; all checks passed."
     else
@@ -254,18 +304,18 @@ fi
 extra_stage() {
     local num=$1 key=$2 title=$3
     shift 3
-    stage_header "Stage $num: $title"
+    stage_header "Stage $num: $title$( (( ADD )) && echo ', added to the earlier run')"
+    local run_dir before
+    before=$(latest_run "$PIPE_DIR/$num"_*)
     run_logged "$@"
-    local run_dir
     run_dir=$(latest_run "$PIPE_DIR/$num"_*)
-    run_dir=${run_dir:-}
-    set_stage "${key}_RUN" "${run_dir#"$PIPE_DIR"/}"
+    [[ "$run_dir" == "$before" ]] && run_dir=""
     if (( STAGE_RC != 0 )) || [[ -z "$run_dir" ]]; then
-        set_stage "${key}_STATUS" failed
-        plog "Stage $num FAILED (exit $STAGE_RC); continuing. Rerun it with: bash run-all.sh --only $num"
+        record_run "$key" "$run_dir" failed
+        plog "Stage $num FAILED (exit $STAGE_RC); continuing. Rerun it with the same options and --only $num"
         bash "$SCRIPT_DIR/stop-single-dn-cluster.sh" 1024 >> "$PLOG" 2>&1 || true
     else
-        set_stage "${key}_STATUS" ok
+        record_run "$key" "$run_dir" ok
         plog "Stage $num done."
     fi
 }

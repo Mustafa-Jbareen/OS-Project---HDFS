@@ -119,6 +119,21 @@ At 100 GB, 1 map per node takes about 3.4 h per job (8 maps per node about
 75 min), which is where most of the time goes. `MAIN_K_VALUES="1 256 1024"`
 in front of the command shortens the run to about 4 days.
 
+### Adding k values to a finished pipeline: `--pipeline`, `--only 2,4,5,6`, `--add`
+
+```bash
+MAIN_K_VALUES="1 1024" bash run-all.sh --pipeline pipeline_<timestamp>_90GB_32MB --only 2,4,5,6 --add
+```
+
+This measures more k values for an existing pipeline, with its own input,
+and records the new runs next to the earlier ones (`*_ADD_RUNS` in
+`stages.env`) instead of replacing them.
+
+The report combines the runs. Each k is compared with the smallest k of its
+own session, so measure k=1 again in the added run. A "Runs combined"
+section shows whether k=1 moved between the sessions, which would mean the
+cluster drifted. `--only` takes a list of stages.
+
 ## Single runs
 
 On the laptop, in PowerShell, from `my_scripts\`:

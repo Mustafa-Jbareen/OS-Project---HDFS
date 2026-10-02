@@ -188,7 +188,42 @@ python experiments\storage_virtualization_loopback\final-report.py ..\storage_vi
 5. LOCAL, when it is done: `.\sync-cluster.ps1 pull`. The report and figures
    go into `hadoop\pipeline_<date>_100GB_16MB\`.
 
-## 9. Single runs instead of the pipeline
+## 9. Add missing k values to a finished pipeline
+
+Example: the 90 GB pipeline, whose k=1024 jobs failed before the block-size
+fix. This measures k=1 and k=1024 again for the main run and both controls,
+and adds them to that pipeline's report.
+
+1. LOCAL: send the fixed code (only once nothing is running on Tapuz).
+
+   ```powershell
+   cd C:\Users\mostufa.j\Desktop\Dan\hadoop\my_scripts
+   .\sync-cluster.ps1 push
+   ```
+
+2. TAPUZ: run the main run (2) and the two controls (4, 5) again, then the
+   report (6). `--pipeline` names the folder in `results/`, and `--add`
+   keeps the earlier runs.
+
+   ```bash
+   screen -r exp
+   cd /home/mostufa.j/my_scripts/experiments/storage_virtualization_loopback
+   MAIN_K_VALUES="1 1024" bash run-all.sh --pipeline pipeline_2026-09-28_08-37-09_90GB_32MB --only 2,4,5,6 --add
+   ```
+
+   - It uses the pipeline's own input (90 GB, 32 MB blocks) and 5
+     repetitions, like the first run. It takes about 3 days; add `--reps 3`
+     for about 2.
+   - The benchmark (stage 3) is not repeated: its k=1024 was fine.
+   - k=1 runs again on purpose. Each k is compared with k=1 from its own
+     session, and the report's "Runs combined" section shows whether the
+     cluster drifted since the first run.
+
+3. LOCAL, when it is done: `.\sync-cluster.ps1 pull`. The report and figures
+   of `hadoop\pipeline_2026-09-28_08-37-09_90GB_32MB\` then cover k = 1 to
+   1024.
+
+## 10. Single runs instead of the pipeline
 
 TAPUZ, in the experiment folder, inside screen:
 
