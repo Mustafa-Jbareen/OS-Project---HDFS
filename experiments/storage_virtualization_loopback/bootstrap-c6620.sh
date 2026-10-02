@@ -6,7 +6,7 @@
 #              1. checks passwordless SSH from the master to every node
 #              2. /scratch -> /mydata symlink on every node (/mydata = the
 #                 profile's temporary filesystem on the local disk)
-#              3. installs Java 11, sysstat, e2fsprogs, bc, python3, curl
+#              3. installs Java 11, sysstat, e2fsprogs, bc, python3, curl, screen
 #              4. installs Hadoop (the version in clusters/c6620.conf) under
 #                 /scratch/hadoop on every node -- downloaded once on the
 #                 master -- and sets JAVA_HOME in its hadoop-env.sh
@@ -99,7 +99,7 @@ run_on_all "$SCRATCH_SCRIPT"
 
 # ---- Step 3: Java 11 and tools ---------------------------------------------
 echo ""
-echo "=== STEP 3: Java 11, sysstat, e2fsprogs, bc, python3, curl on every node ==="
+echo "=== STEP 3: Java 11, sysstat, e2fsprogs, bc, python3, curl, screen on every node ==="
 read -r -d '' PKG_SCRIPT <<'REMOTE' || true
 set -e
 need=()
@@ -109,6 +109,7 @@ command -v filefrag >/dev/null 2>&1 || need+=(e2fsprogs)
 command -v bc >/dev/null 2>&1 || need+=(bc)
 command -v python3 >/dev/null 2>&1 || need+=(python3)
 command -v curl >/dev/null 2>&1 || need+=(curl)
+command -v screen >/dev/null 2>&1 || need+=(screen)
 if (( ${#need[@]} > 0 )); then
     # A fresh node's automatic updates may hold the apt lock for a while: wait for it.
     sudo apt-get -o DPkg::Lock::Timeout=900 update -qq
