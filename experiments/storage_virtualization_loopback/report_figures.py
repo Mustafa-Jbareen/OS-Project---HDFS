@@ -74,6 +74,34 @@ def _pct(v, _pos=None):
     return "0%" if abs(v) < 1e-9 else f"{v:+g}%"
 
 
+def _even_k_scale(ks):
+    """Axis functions that put the tested k values at evenly spaced positions.
+
+    On a plain log axis 1 -> 64 takes most of the width and 256, 512 and 1024
+    (where the effect is) crowd the right edge; here every tested k gets the
+    same room. Between and beyond the tested values the scale is log2-linear.
+    """
+    import numpy as np
+
+    lk = np.log2(np.asarray(ks, dtype=float))
+    idx = np.arange(len(lk), dtype=float)
+
+    def forward(x):
+        p = np.log2(np.maximum(np.asarray(x, dtype=float), 1e-9))
+        y = np.interp(p, lk, idx)
+        y = np.where(p < lk[0], (p - lk[0]) / (lk[1] - lk[0]), y)
+        return np.where(p > lk[-1], idx[-1] + (p - lk[-1]) / (lk[-1] - lk[-2]), y)
+
+    def inverse(y):
+        y = np.asarray(y, dtype=float)
+        p = np.interp(y, idx, lk)
+        p = np.where(y < 0, lk[0] + y * (lk[1] - lk[0]), p)
+        p = np.where(y > idx[-1], lk[-1] + (y - idx[-1]) * (lk[-1] - lk[-2]), p)
+        return 2 ** p
+
+    return forward, inverse
+
+
 def _style_axes(ax, ks=None, zero=False, pct=False, y_from_zero=False):
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
@@ -82,11 +110,16 @@ def _style_axes(ax, ks=None, zero=False, pct=False, y_from_zero=False):
     ax.tick_params(length=3, width=0.6)
     ax.yaxis.set_major_locator(MaxNLocator(nbins=5, steps=[1, 2, 5, 10], min_n_ticks=3))
     if ks:
-        ax.set_xscale("log", base=2)
+        ks = sorted(set(ks))
+        if len(ks) >= 2:
+            forward, inverse = _even_k_scale(ks)
+            ax.set_xscale("function", functions=(forward, inverse))
+            ax.set_xlim(float(inverse(-0.35)), float(inverse(len(ks) - 1 + 0.35)))
+        else:
+            ax.set_xscale("log", base=2)
         ax.set_xticks(ks)
         ax.xaxis.set_minor_locator(NullLocator())
         ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{int(round(v))}"))
-        ax.set_xlim(min(ks) / 1.3, max(ks) * 1.3)
     if zero:
         ax.axhline(0, color=AXIS, linewidth=0.9, zorder=1)
     if pct:

@@ -3,6 +3,49 @@
 Question: what happens to a server when its one physical disk is split into
 k virtual disks (here: k loopback ext4 filesystems under one DataNode)?
 
+## 0. The controlled run of September 2026 (corrects section 2)
+
+Tapuz, `pipeline_2026-09-27_20-42-03`: 2 GB in 32 MB blocks, 5 repetitions.
+k is in a random order, every condition runs at every k, and every job
+follows the same protocol.
+
+| Condition | k=1 -> k=1024 runtime [95% CI] | Time per map task |
+|---|---|---|
+| 1 map/node, cold | +12.1% [+10.2, +14.0] | +6.9% |
+| 1 map/node, warm | +11.6% [+9.5, +13.8] | +7.6% |
+| 4 maps/node, cold | +12.8% [+10.7, +14.9] | +10.8% |
+| 8 maps/node, cold | +14.9% [+10.9, +18.9] | +15.1% |
+| 8 maps/node, warm | +14.8% [+11.1, +18.6] | +17.0% |
+
+- **k=1024 is 12-15% slower at every load and cache state.** The cost
+  starts between k=256 and k=512. The page cache makes no difference. Load
+  adds only ~3 points, and that difference is not significant.
+- **Section 2's conclusion, that light load shows no slowdown, does not
+  hold.** The May 9 Tapuz run hid the slowdown by chance:
+  - its map tasks were 4% slower at k=1024 (section 3);
+  - but YARN kept 3.5% more maps running at once in both k=1024 jobs (2.65
+    vs 2.56), which cancelled the slower tasks in the runtime;
+  - with 2 repetitions this was invisible.
+
+  With one container per node, the runtime depends on where YARN places the
+  ApplicationMaster and the reducer. Time per map task does not, so it is
+  the better measure at light load.
+- **Scheduling outliers:** 3 of the 50 one-map-per-node jobs ran 1.8 maps at
+  once instead of 2.4. `final-report.py` now leaves such jobs out (below 85%
+  of their condition's median) and lists them.
+- **Not the kernel's read path.** Reading the same data through 1024
+  loopback filesystems without Hadoop is not slower (storage-only
+  benchmark). Direct I/O on the loop devices does not change the slowdown.
+  The cost comes with the DataNode managing 1024 volumes:
+  - threads: 73 -> 2137;
+  - RSS: 0.6 -> 2.3 GB;
+  - DataNode start to first block report: 2 s -> 10 min.
+- **The mkfs control could not test the old 1 KB layout:** this OS's mkfs
+  gives small images 4 KB blocks too.
+- **Swapping** happened only in the 8-maps warm jobs at k >= 512 (Tapuz has
+  7.7 GB of RAM). The cold 8-maps jobs did not swap and slowed down by the
+  same amount.
+
 ## 1. Under load, k=1024 makes WordCount 9-16% slower
 
 Runtime change vs k=1. "Maps at once" = average number of map tasks running
@@ -26,6 +69,10 @@ reading it from disk. So the slowdown is **not** a page-cache artifact and
 not an HDD-seek effect.
 
 ## 2. The runs without slowdown ran at a much lower load
+
+> Corrected by section 0: light load also slows down, by 12% at k=1024 in
+> the controlled run. The low load explains why the runtimes below are
+> noisy, not why the slowdown is missing.
 
 | Run | Hardware | Maps at once | Data-local | k=1024 |
 |---|---|---|---|---|

@@ -151,13 +151,35 @@ def load_stages(pipe_dir):
 
 
 # ---------------------------------------------------------------- run data
+# A job whose YARN scheduling ran clearly fewer maps at once than the rest of
+# its condition (with one map per node, the ApplicationMaster or the reducer
+# can take a node's only container) measures the scheduler, not the storage.
+# Such jobs are left out of the statistics and listed in the report.
+SCHED_OUTLIER_SHARE = 0.85
+
+
+def drop_scheduling_outliers(rows):
+    conc = defaultdict(list)
+    for r in rows:
+        v = fnum(r.get("avg_concurrent_maps"))
+        if v is not None and v > 0:
+            conc[r["condition"]].append(v)
+    median = {c: statistics.median(v) for c, v in conc.items()}
+    keep, dropped = [], []
+    for r in rows:
+        v, m = fnum(r.get("avg_concurrent_maps")), median.get(r["condition"])
+        (dropped if v is not None and m and v < SCHED_OUTLIER_SHARE * m else keep).append(r)
+    return keep, dropped, median
+
+
 class Run:
     """One run of run-experiment-loopback-fs.sh."""
 
     def __init__(self, run_dir):
         self.dir = run_dir
         self.meta = read_json(os.path.join(run_dir, "metadata.json"))
-        self.rows = [r for r in read_csv(os.path.join(run_dir, "runs.csv")) if r.get("status") == "ok"]
+        ok = [r for r in read_csv(os.path.join(run_dir, "runs.csv")) if r.get("status") == "ok"]
+        self.rows, self.sched_outliers, self.conc_median = drop_scheduling_outliers(ok)
         self.all_rows = read_csv(os.path.join(run_dir, "runs.csv"))
         self.dn = {(r["k"], r["rep"], r["order_pos"], r["condition"]): r
                    for r in read_csv(os.path.join(run_dir, "dn_metrics.csv"))}
@@ -285,6 +307,16 @@ def section_main(run, lines, figs):
         base = run.runtimes(c, run.ks[0])
         rows.append([c] + [fmt_change(*change(base, run.runtimes(c, k))) for k in run.ks[1:]])
     lines += md_table(["condition"] + [f"k={k}" for k in run.ks[1:]], rows) + [""]
+    if run.sched_outliers:
+        lines += [f"Left out: {len(run.sched_outliers)} job(s) in which YARN ran clearly fewer maps at once "
+                  f"(below {SCHED_OUTLIER_SHARE:.0%} of their condition's median), because the ApplicationMaster "
+                  "or the reducer took a node's container. They measure the scheduler, not the storage:", ""]
+        for r in run.sched_outliers:
+            lines.append(f"- {r['condition']} k={r['k']} rep {r['rep']}: {fnum(r['runtime_s']):.1f} s, "
+                         f"{fnum(r['avg_concurrent_maps']):.1f} maps at once "
+                         f"(median {run.conc_median[r['condition']]:.1f}); time per map task "
+                         f"{fnum(r['avg_map_s']):.2f} s")
+        lines.append("")
     if figs.enabled and len(run.ks) >= 2:
         figure_runtime(run, figs, lines)
 
