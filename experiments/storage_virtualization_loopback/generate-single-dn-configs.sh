@@ -39,6 +39,7 @@ REPLICATION=${5:-3}
 HADOOP_HOME="${HADOOP_HOME:?HADOOP_HOME must be set (export from caller)}"
 HADOOP_CONF="$HADOOP_HOME/etc/hadoop"
 MASTER_NODE="${MASTER_NODE:?MASTER_NODE must be set (export from caller)}"
+BLOCK_SIZE_MB="${BLOCK_SIZE_MB:?BLOCK_SIZE_MB must be set (export from caller)}"
 NAMENODE_PORT=9000
 JOBHISTORY_RPC_PORT=10020
 JOBHISTORY_WEB_PORT=19888
@@ -185,6 +186,16 @@ cat > "$CONFIG_DIR/hdfs-site.xml" <<EOF
   <property>
     <name>dfs.replication</name>
     <value>$REPLICATION</value>
+  </property>
+
+  <!-- Every HDFS file of the experiment (input, job staging files, output) uses
+       the experiment's block size. A DataNode writes a new block only on a
+       volume with a whole block free; with Hadoop's 128 MB default, a large
+       input left no 200 MB image (k=1024) with room for the job's files, and
+       every job failed at submission. -->
+  <property>
+    <name>dfs.blocksize</name>
+    <value>$(( BLOCK_SIZE_MB * 1024 * 1024 ))</value>
   </property>
 
   <!-- DataNode data directories (comma-separated list of k loopback filesystems) -->

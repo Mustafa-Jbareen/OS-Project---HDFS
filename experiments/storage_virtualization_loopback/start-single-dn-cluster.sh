@@ -131,7 +131,7 @@ done
 wait
 
 # Run config generation in parallel. Every node gets the same YARN settings.
-GEN_ENV="HADOOP_HOME=$HADOOP_HOME MASTER_NODE=$MASTER_NODE SLOTS_PER_NODE=$SLOTS_PER_NODE CONTAINER_MB=$CONTAINER_MB"
+GEN_ENV="HADOOP_HOME=$HADOOP_HOME MASTER_NODE=$MASTER_NODE SLOTS_PER_NODE=$SLOTS_PER_NODE CONTAINER_MB=$CONTAINER_MB BLOCK_SIZE_MB=$BLOCK_SIZE_MB"
 declare -A CONFIG_PIDS
 for node in "${ALL_NODES[@]}"; do
     echo "--- Starting config on $node ---"

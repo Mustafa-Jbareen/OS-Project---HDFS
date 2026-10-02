@@ -1016,6 +1016,21 @@ preflight() {
         echo "  hadoop-mapreduce-examples jar not found under $HADOOP_HOME/share/hadoop/mapreduce"
         fail=1
     fi
+    # At the largest k, every image must keep at least two blocks free once the
+    # input is in: the job's own files and its output need new blocks. (A 90 GB
+    # input at k=1024 left ~110 MB per 200 MB image; with 128 MB blocks for
+    # those files every job failed at submission.)
+    local kmax=0 k img_mb per_vol_mb usable_mb
+    for k in "${K_VALUES[@]}"; do (( k > kmax )) && kmax=$k; done
+    img_mb=$(calc_image_size_mb "$kmax")
+    per_vol_mb=$(( INPUT_SIZE_MB * REPLICATION / ${#DATANODE_NODES[@]} / kmax ))
+    usable_mb=$(( img_mb * 88 / 100 ))   # ext4 journal, inode tables and bitmaps take ~10%
+    if (( usable_mb - per_vol_mb < 2 * BLOCK_SIZE_MB )); then
+        echo "  input too large for k=$kmax: ~${per_vol_mb} MB of blocks per ${img_mb} MB image leaves"
+        echo "    less than two ${BLOCK_SIZE_MB} MB blocks free (lower the input or the largest k,"
+        echo "    or raise LOOPBACK_BUDGET_PER_NODE_GB)"
+        fail=1
+    fi
     local need_gb=$(( LOOPBACK_BUDGET_PER_NODE_GB + 5 ))
     for node in "${DATANODE_NODES[@]}"; do
         avail_gb=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
@@ -1113,7 +1128,7 @@ copy_node_helpers
 
 # Save metadata
 export LOOPBACK_BUDGET_PER_NODE_GB MIN_IMAGE_SIZE_MB K_REPS
-export TIMESTAMP INPUT_SIZE_MB BLOCK_SIZE BLOCK_SIZE_HUMAN REPLICATION
+export TIMESTAMP INPUT_SIZE_MB BLOCK_SIZE BLOCK_SIZE_MB BLOCK_SIZE_HUMAN REPLICATION
 export NUM_PHYSICAL_NODES RUN_DIR NUM_DATANODE_HOSTS MASTER_HAS_DN
 export WORDCOUNT_MODE STORAGE_BASE CLUSTER CODE_VERSION SEED K_ORDER REUPLOAD_EACH_REP
 export SLOTS_PER_NODE CONTAINER_MB TASK_HEAP_MB DN_HEAP_MB SETTLE_SECONDS WARMUP_JOBS MKFS_MODE LOOP_DIRECT_IO
@@ -1546,3 +1561,10 @@ echo "  here:    python3 $SCRIPT_DIR/final-report.py $RUN_DIR"
 echo "  laptop:  .\\sync-cluster.ps1 pull, then in PowerShell (in my_scripts):"
 echo "           python experiments\\storage_virtualization_loopback\\final-report.py ..\\${REL_RUN//\//\\}"
 echo "============================================================"
+
+# Missing cells make the comparison incomplete: say so with the exit status,
+# so run-all.sh stops (or marks an extra stage failed) instead of going on.
+if (( FAILED_JOBS > 0 )); then
+    echo "WARNING: $FAILED_JOBS measured job(s) failed (status 'failed' in runs.csv; see jobs/*.log)."
+    exit 3
+fi

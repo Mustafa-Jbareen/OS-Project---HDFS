@@ -291,6 +291,11 @@ def section_setup(run, lines):
 
 def section_main(run, lines, figs):
     lines += ["## 1. Runtime vs k", ""]
+    missing = [k for k in run.meta.get("k_values", []) if k not in run.ks]
+    if missing:
+        failed = sum(1 for r in run.all_rows if r.get("status") == "failed")
+        lines += [f"**No results for k = {', '.join(str(k) for k in sorted(missing))}:** every job there failed "
+                  f"({failed} failed job(s) in runs.csv; the reason is in jobs/*.log).", ""]
     header = ["condition"] + [f"k={k}" for k in run.ks]
     rows = []
     for c in run.conditions:
